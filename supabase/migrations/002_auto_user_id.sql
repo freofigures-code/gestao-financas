@@ -1,0 +1,3 @@
+-- Preenche user_id automaticamente em inserts autenticados para o front poder inserir sem repetir auth.uid().
+create or replace function public.fill_user_id() returns trigger language plpgsql as $$ begin if new.user_id is null then new.user_id:=auth.uid(); end if; if new.user_id is null then raise exception 'user_id ausente'; end if; return new; end $$;
+do $$ declare t text; begin foreach t in array array['months_control','categories','products','product_variants','sales','sale_items','expenses','income','stock_suggestions','ai_analyses','custom_columns'] loop execute format('create trigger %I_fill_user before insert on public.%I for each row execute function public.fill_user_id()',t,t); end loop; end $$;

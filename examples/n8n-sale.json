@@ -1,0 +1,14 @@
+{
+  "order_sn": "250819ABC123",
+  "sold_at": "2026-08-19",
+  "status": "paid",
+  "items": [
+    {
+      "sku": "NAMI-15CM-01",
+      "product": "Nami",
+      "variant": "15 cm",
+      "quantity": 2,
+      "unit_gross": "49.90"
+    }
+  ]
+}
