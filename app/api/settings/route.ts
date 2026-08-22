@@ -30,8 +30,9 @@ export async function POST(req: Request) {
       p_user_id: user.id,
       p_commission: body.fees.shopee_commission_percent,
       p_fixed_fee: body.fees.shopee_fixed_fee,
-      p_default_filament: body.fees.default_filament_cost,
-      p_default_energy: body.fees.default_energy_cost,
+      p_filament_price_per_kg: body.fees.filament_price_per_kg,
+      p_energy_price_per_kwh: body.fees.energy_price_per_kwh,
+      p_default_printer_power_watts: body.fees.default_printer_power_watts,
       p_default_packaging: body.fees.default_packaging_cost,
     });
     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
