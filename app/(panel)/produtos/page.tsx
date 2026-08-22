@@ -35,6 +35,14 @@ function normalizeDecimal(value: string) {
   return decimalParts.length ? `${integerPart || "0"}.${decimalParts.join("")}` : integerPart;
 }
 
+function normalizeSearch(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
 export default function Produtos() {
   const { month } = useMonth();
   const customColumns = useCustomColumns("products");
@@ -53,6 +61,7 @@ export default function Produtos() {
   const [printTimeHours, setPrintTimeHours] = useState("");
   const [printerPowerWatts, setPrinterPowerWatts] = useState("");
   const [pack, setPack] = useState("");
+  const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkSaving, setBulkSaving] = useState(false);
   const [bulk, setBulk] = useState({
@@ -139,7 +148,23 @@ export default function Produtos() {
   }
 
   const allVariants = useMemo(() => data.flatMap((p) => p.product_variants ?? []), [data]);
-  const allSelected = allVariants.length > 0 && allVariants.every((v: any) => selected.has(v.id));
+  const filteredData = useMemo(() => {
+    const term = normalizeSearch(search);
+    if (!term) return data;
+    return data
+      .map((product) => {
+        const productMatches = normalizeSearch(String(product.name ?? "")).includes(term);
+        const variants = (product.product_variants ?? []).filter((variant: any) =>
+          productMatches
+          || normalizeSearch(String(variant.name ?? "")).includes(term)
+          || normalizeSearch(String(variant.sku ?? "")).includes(term),
+        );
+        return variants.length ? { ...product, product_variants: variants } : null;
+      })
+      .filter(Boolean);
+  }, [data, search]);
+  const visibleVariants = useMemo(() => filteredData.flatMap((p: any) => p.product_variants ?? []), [filteredData]);
+  const allSelected = visibleVariants.length > 0 && visibleVariants.every((v: any) => selected.has(v.id));
   const smap = useMemo(() => new Map(stats.map((s) => [s.variant_id, s])), [stats]);
   const sugg = (id: string, w: number) => suggestions.find((s) => s.variant_id === id && s.window_days === w);
 
@@ -152,7 +177,13 @@ export default function Produtos() {
   }
 
   function selectAll(checked: boolean) {
-    setSelected(checked ? new Set(allVariants.map((v: any) => v.id)) : new Set());
+    setSelected((current) => {
+      const next = new Set(current);
+      for (const variant of visibleVariants) {
+        if (checked) next.add(variant.id); else next.delete(variant.id);
+      }
+      return next;
+    });
   }
 
   async function applyBulk() {
@@ -215,6 +246,23 @@ export default function Produtos() {
       </Card>
 
       <Card>
+        <CardHeader><CardTitle>Pesquisar produto ou variação</CardTitle></CardHeader>
+        <CardContent className="space-y-2">
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Digite nome do produto, nome da variação ou SKU..."
+            aria-label="Pesquisar produto, variação ou SKU"
+          />
+          <p className="text-xs text-muted-foreground">
+            {search.trim()
+              ? `${visibleVariants.length} variação(ões) encontrada(s) de ${allVariants.length}.`
+              : `${allVariants.length} variação(ões) cadastrada(s).`}
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
         <CardHeader><CardTitle>Edição em massa das variações</CardTitle></CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">Selecione as variações na tabela e marque somente os campos que deseja alterar. Ex.: marque apenas Potência, informe 300 W e aplique em todas.</p>
@@ -240,13 +288,15 @@ export default function Produtos() {
         <Table>
           <THead>
             <TR>
-              <TH><input type="checkbox" aria-label="Selecionar todas as variações" checked={allSelected} onChange={(e) => selectAll(e.target.checked)} /></TH>
+              <TH><input type="checkbox" aria-label="Selecionar todas as variações visíveis" checked={allSelected} onChange={(e) => selectAll(e.target.checked)} /></TH>
               <TH>Produto</TH><TH>Variação</TH><TH>SKU</TH><TH>Consumo e custo / unidade</TH><TH>Qtd mês</TH><TH>Faturamento mês</TH><TH>Sugestões 30/60/90d</TH><TH>Estoque manual</TH>
               {customColumns.map((c) => <TH key={c.id}>{c.label}</TH>)}
             </TR>
           </THead>
           <TBody>
-            {data.flatMap((p) => p.product_variants.map((v: any) => <VariantRow key={v.id} p={p} v={v} fees={fees} st={smap.get(v.id)} s30={sugg(v.id, 30)} s60={sugg(v.id, 60)} s90={sugg(v.id, 90)} customColumns={customColumns} onSaved={refresh} checked={selected.has(v.id)} onChecked={(checked: boolean) => setVariantSelected(v.id, checked)} />))}
+            {visibleVariants.length === 0 ? (
+              <TR><TD colSpan={9 + customColumns.length} className="text-muted-foreground">Nenhum produto, variação ou SKU encontrado.</TD></TR>
+            ) : filteredData.flatMap((p: any) => (p.product_variants ?? []).map((v: any) => <VariantRow key={v.id} p={p} v={v} fees={fees} st={smap.get(v.id)} s30={sugg(v.id, 30)} s60={sugg(v.id, 60)} s90={sugg(v.id, 90)} customColumns={customColumns} onSaved={refresh} checked={selected.has(v.id)} onChecked={(checked: boolean) => setVariantSelected(v.id, checked)} />))}
           </TBody>
         </Table>
       </div>
