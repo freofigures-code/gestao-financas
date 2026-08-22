@@ -6,17 +6,39 @@ export const D = (v: MoneyInput | null | undefined) => new Decimal(v ?? 0);
 export const money = (v: MoneyInput) => D(v).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
 export const percent = (gross: MoneyInput, pct: MoneyInput) => money(D(gross).mul(D(pct)).div(100));
 
-export function calculateShopee(gross: MoneyInput, commissionPct: MoneyInput, fixedFee: MoneyInput) {
-  const bruto = money(gross);
-  const taxaPercentual = percent(bruto, commissionPct);
-  const taxas = money(taxaPercentual.plus(D(fixedFee)));
+/**
+ * Shopee configurable estimate.
+ * IMPORTANT: commission is rounded per UNIT and the fixed fee is charged per UNIT.
+ * Never apply the fixed fee once to the whole order.
+ */
+export function calculateShopee(
+  unitGross: MoneyInput,
+  commissionPct: MoneyInput,
+  fixedFeePerUnit: MoneyInput,
+  quantity = 1,
+) {
+  if (!Number.isInteger(quantity) || quantity <= 0) throw new Error("Quantidade inválida");
+  const unit = money(unitGross);
+  const qty = new Decimal(quantity);
+  const bruto = money(unit.mul(qty));
+  const taxaPercentualUnidade = percent(unit, commissionPct);
+  const taxaPercentual = money(taxaPercentualUnidade.mul(qty));
+  const taxaFixaUnidade = money(fixedFeePerUnit);
+  const taxaFixa = money(taxaFixaUnidade.mul(qty));
+  const taxas = money(taxaPercentual.plus(taxaFixa));
   const liquido = money(bruto.minus(taxas));
-  return { bruto, taxaPercentual, taxas, liquido };
+  return { bruto, taxaPercentualUnidade, taxaPercentual, taxaFixaUnidade, taxaFixa, taxas, liquido };
 }
 
-export function calculateSale(gross: MoneyInput, commissionPct: MoneyInput, fixedFee: MoneyInput, productionCost: MoneyInput) {
-  const shopee = calculateShopee(gross, commissionPct, fixedFee);
-  const custo = money(productionCost);
+export function calculateSale(
+  unitGross: MoneyInput,
+  commissionPct: MoneyInput,
+  fixedFeePerUnit: MoneyInput,
+  productionCostUnit: MoneyInput,
+  quantity = 1,
+) {
+  const shopee = calculateShopee(unitGross, commissionPct, fixedFeePerUnit, quantity);
+  const custo = money(D(productionCostUnit).mul(quantity));
   const lucro = money(shopee.liquido.minus(custo));
   return { ...shopee, custo, lucro };
 }

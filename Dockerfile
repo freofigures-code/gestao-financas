@@ -25,7 +25,8 @@ ENV NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=$NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
 ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN npm run build
+# Regressão financeira antes do build. Qualquer falha impede o deploy.
+RUN npm run test:finance && npm run build
 
 # 3. Imagem final de produção (enxuta)
 FROM base AS runner

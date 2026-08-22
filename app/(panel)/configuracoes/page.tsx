@@ -17,6 +17,8 @@ const SHOPEE_TOKEN_PATH = "/api/v2/auth/token/get";
 const SHOPEE_REFRESH_PATH = "/api/v2/auth/access_token/get";
 const SHOPEE_ORDER_LIST_PATH = "/api/v2/order/get_order_list";
 const SHOPEE_ORDER_DETAIL_PATH = "/api/v2/order/get_order_detail";
+const SHOPEE_ESCROW_BATCH_PATH = "/api/v2/payment/get_escrow_detail_batch";
+const SHOPEE_WALLET_TX_PATH = "/api/v2/payment/get_wallet_transaction_list";
 const MAX_LIST_PAGES_PER_WINDOW = 500;
 const ORDER_DETAIL_BATCH = 50;
 const LIST_PAGE_SIZE = 100;
@@ -242,7 +244,7 @@ async function refreshShopeeToken(userId: string, config: ShopeeConfig) {
   return next;
 }
 
-async function shopeeGet(config: ShopeeConfig, path: string, params: Record<string, string>) {
+async function shopeeGet(config: ShopeeConfig, path: string, params: Record<string, string | string[]>) {
   const timestamp = Math.floor(Date.now() / 1000);
   const sign = signShop(config, path, timestamp);
   const url = new URL(`${SHOPEE_HOST}${path}`);
@@ -251,8 +253,27 @@ async function shopeeGet(config: ShopeeConfig, path: string, params: Record<stri
   url.searchParams.set("sign", sign);
   url.searchParams.set("access_token", config.accessToken!);
   url.searchParams.set("shop_id", config.shopId!);
-  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  for (const [key, value] of Object.entries(params)) {
+    if (Array.isArray(value)) value.forEach((item) => url.searchParams.append(key, item));
+    else url.searchParams.set(key, value);
+  }
   return shopeeJson(url.toString());
+}
+
+async function shopeePost(config: ShopeeConfig, path: string, payload: Record<string, unknown>) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sign = signShop(config, path, timestamp);
+  const url = new URL(`${SHOPEE_HOST}${path}`);
+  url.searchParams.set("partner_id", config.partnerId);
+  url.searchParams.set("timestamp", String(timestamp));
+  url.searchParams.set("sign", sign);
+  url.searchParams.set("access_token", config.accessToken!);
+  url.searchParams.set("shop_id", config.shopId!);
+  return shopeeJson(url.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 function saoPauloMidnightUnix(year: number, month: number, day: number) {
@@ -362,47 +383,19 @@ function toIngestSale(order: ShopeeOrder): IngestSale {
 
   if (units.length === 0) throw new Error(`Pedido ${orderSn} sem unidades válidas`);
 
-  const fallbackTotal = units.reduce((sum, unit) => sum.plus(unit.basePrice), new Decimal(0));
-  let targetTotal = fallbackTotal;
-  if (order.total_amount !== undefined && order.total_amount !== null && String(order.total_amount).trim() !== "") {
-    try {
-      const apiTotal = new Decimal(String(order.total_amount));
-      if (apiTotal.isFinite() && !apiTotal.isNegative()) targetTotal = apiTotal;
-    } catch {
-      throw new Error(`Total do pedido ${orderSn} inválido retornado pela Shopee`);
-    }
-  }
-
-  const targetCents = targetTotal.mul(100).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
-  const weightTotal = units.reduce((sum, unit) => sum.plus(unit.basePrice), new Decimal(0));
-  const allocations = units.map((unit, index) => {
-    const exact = weightTotal.gt(0)
-      ? targetCents.mul(unit.basePrice).div(weightTotal)
-      : targetCents.div(units.length);
-    const floor = exact.floor();
-    return { index, cents: floor, remainder: exact.minus(floor) };
-  });
-  let allocated = allocations.reduce((sum, allocation) => sum.plus(allocation.cents), new Decimal(0));
-  let missing = targetCents.minus(allocated).toNumber();
-  allocations.sort((a, b) => {
-    const remainderOrder = b.remainder.comparedTo(a.remainder);
-    return remainderOrder !== 0 ? remainderOrder : a.index - b.index;
-  });
-  for (let i = 0; i < missing; i += 1) allocations[i % allocations.length].cents = allocations[i % allocations.length].cents.plus(1);
-  allocations.sort((a, b) => a.index - b.index);
-  allocated = allocations.reduce((sum, allocation) => sum.plus(allocation.cents), new Decimal(0));
-  if (!allocated.eq(targetCents)) throw new Error(`Falha ao conciliar centavos do pedido ${orderSn}`);
-
+  // A taxa configurada da Shopee deve incidir sobre o valor dos produtos, nunca sobre frete.
+  // model_discounted_price/model_original_price são preços unitários do item; cada unidade
+  // é enviada separadamente para preservar o arredondamento da comissão POR UNIDADE.
   return {
     order_sn: orderSn,
     sold_at: saoPauloDateFromUnix(dateSource),
     status: mapShopeeStatus(orderStatus),
-    items: units.map((unit, index) => ({
+    items: units.map((unit) => ({
       sku: unit.sku,
       product: unit.product,
       variant: unit.variant,
       quantity: 1,
-      unit_gross: allocations[index].cents.div(100).toFixed(2),
+      unit_gross: unit.basePrice.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2),
     })),
   };
 }
@@ -437,9 +430,10 @@ async function collectOrderSns(config: ShopeeConfig, timeRangeField: "create_tim
 }
 
 async function ingestOrderSns(userId: string, config: ShopeeConfig, orderSns: string[]) {
-  if (orderSns.length === 0) return 0;
+  if (orderSns.length === 0) return { imported: 0, completedOrderSns: [] as string[] };
   const admin = createAdminClient();
   let imported = 0;
+  const completedOrderSns = new Set<string>();
 
   for (let i = 0; i < orderSns.length; i += ORDER_DETAIL_BATCH) {
     const batch = orderSns.slice(i, i + ORDER_DETAIL_BATCH);
@@ -448,39 +442,172 @@ async function ingestOrderSns(userId: string, config: ShopeeConfig, orderSns: st
       response_optional_fields: "item_list,pay_time,total_amount",
     });
     const response = body.response && typeof body.response === "object" ? (body.response as Record<string, unknown>) : null;
-    if (!response || !Array.isArray(response.order_list)) {
-      throw new Error("Resposta de get_order_detail sem order_list");
+    if (!response || !Array.isArray(response.order_list)) throw new Error("Resposta de get_order_detail sem order_list");
+    const orders = response.order_list as ShopeeOrder[];
+    for (const order of orders) {
+      if (String(order.order_status ?? "").trim().toUpperCase() === "COMPLETED" && order.order_sn) {
+        completedOrderSns.add(String(order.order_sn));
+      }
     }
-    const sales = (response.order_list as ShopeeOrder[]).map(toIngestSale);
+    const sales = orders.map(toIngestSale);
     if (sales.length === 0) continue;
-    const { data, error } = await admin.rpc("ingest_sales_batch", {
-      p_user_id: userId,
-      p_sales: sales,
-      p_source: "integration",
-    });
+    const { data, error } = await admin.rpc("ingest_sales_batch", { p_user_id: userId, p_sales: sales, p_source: "integration" });
     if (error) throw error;
     imported += Number(data ?? sales.length);
   }
 
-  return imported;
+  return { imported, completedOrderSns: [...completedOrderSns] };
 }
 
-async function syncRange(
-  userId: string,
-  config: ShopeeConfig,
-  from: number,
-  to: number,
-  field: "create_time" | "update_time",
-) {
+async function syncRange(userId: string, config: ShopeeConfig, from: number, to: number, field: "create_time" | "update_time") {
   let imported = 0;
+  const completedOrderSns = new Set<string>();
   let cursorFrom = from;
   while (cursorFrom <= to) {
     const cursorTo = Math.min(to, cursorFrom + WINDOW_SECONDS - 1);
     const sns = await collectOrderSns(config, field, cursorFrom, cursorTo);
-    imported += await ingestOrderSns(userId, config, sns);
+    const result = await ingestOrderSns(userId, config, sns);
+    imported += result.imported;
+    result.completedOrderSns.forEach((sn) => completedOrderSns.add(sn));
     cursorFrom = cursorTo + 1;
   }
-  return imported;
+  return { imported, completedOrderSns: [...completedOrderSns] };
+}
+
+function signedMoney(value: unknown, field: string) {
+  try {
+    const decimal = new Decimal(String(value ?? 0));
+    if (!decimal.isFinite()) throw new Error();
+    return decimal.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2);
+  } catch {
+    throw new Error(`${field} inválido retornado pela Shopee`);
+  }
+}
+
+function optionalMoney(value: unknown) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  try {
+    const decimal = new Decimal(String(value));
+    return decimal.isFinite() ? decimal.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function reconcileCompletedEscrow(userId: string, config: ShopeeConfig, orderSns: string[]) {
+  if (orderSns.length === 0) return 0;
+  const admin = createAdminClient();
+  let reconciled = 0;
+
+  for (let i = 0; i < orderSns.length; i += 20) {
+    const batch = orderSns.slice(i, i + 20);
+    const body = await shopeePost(config, SHOPEE_ESCROW_BATCH_PATH, { order_sn_list: batch });
+    const response = Array.isArray(body.response) ? body.response : [];
+    for (const rawEntry of response) {
+      if (!rawEntry || typeof rawEntry !== "object") continue;
+      const entry = rawEntry as Record<string, unknown>;
+      const detail = entry.escrow_detail && typeof entry.escrow_detail === "object" ? entry.escrow_detail as Record<string, unknown> : null;
+      if (!detail) continue;
+      const orderSn = String(detail.order_sn ?? "").trim();
+      const income = detail.order_income && typeof detail.order_income === "object" ? detail.order_income as Record<string, unknown> : null;
+      if (!orderSn || !income) continue;
+      const actualNet = optionalMoney(income.escrow_amount);
+      if (actualNet === null) continue;
+
+      const commission = optionalMoney(income.net_commission_fee) ?? optionalMoney(income.commission_fee) ?? "0.00";
+      const service = optionalMoney(income.net_service_fee) ?? optionalMoney(income.service_fee) ?? "0.00";
+      const transactionFee = optionalMoney(income.seller_transaction_fee) ?? "0.00";
+      const { error } = await admin.rpc("apply_shopee_escrow", {
+        p_user_id: userId,
+        p_order_sn: orderSn,
+        p_actual_net: actualNet,
+        p_commission: commission,
+        p_service: service,
+        p_transaction: transactionFee,
+        p_reconciled_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      reconciled += 1;
+    }
+  }
+  return reconciled;
+}
+
+async function syncWalletRange(userId: string, config: ShopeeConfig, from: number, to: number) {
+  const admin = createAdminClient();
+  let processed = 0;
+  let cursorFrom = from;
+
+  while (cursorFrom <= to) {
+    const cursorTo = Math.min(to, cursorFrom + WINDOW_SECONDS - 1);
+    let pageNo = 0;
+    for (let page = 0; page < MAX_LIST_PAGES_PER_WINDOW; page += 1) {
+      const body = await shopeePost(config, SHOPEE_WALLET_TX_PATH, {
+        page_no: pageNo,
+        page_size: 100,
+        create_time_from: cursorFrom,
+        create_time_to: cursorTo,
+      });
+      const response = body.response && typeof body.response === "object" ? body.response as Record<string, unknown> : null;
+      if (!response) throw new Error("Resposta de get_wallet_transaction_list sem response");
+      const transactions = Array.isArray(response.transaction_list) ? response.transaction_list : [];
+
+      for (const raw of transactions) {
+        if (!raw || typeof raw !== "object") continue;
+        const tx = raw as Record<string, unknown>;
+        const createTime = Number(tx.create_time);
+        if (!Number.isFinite(createTime) || createTime <= 0) throw new Error("Transação Shopee sem create_time válido");
+        const transactionType = String(tx.transaction_type ?? "").trim();
+        const status = String(tx.status ?? "").trim();
+        if (!transactionType || !status) throw new Error("Transação Shopee sem status/tipo");
+        const withdrawalId = tx.withdrawal_id == null ? "" : String(tx.withdrawal_id);
+        const rootWithdrawalId = tx.root_withdrawal_id == null ? "" : String(tx.root_withdrawal_id);
+        const orderSn = String(tx.order_sn ?? "").trim();
+        const refundSn = String(tx.refund_sn ?? "").trim();
+        const amount = signedMoney(tx.amount, "Valor da transação da carteira");
+        const currentBalance = optionalMoney(tx.current_balance);
+        const transactionFee = optionalMoney(tx.transaction_fee) ?? "0.00";
+        const moneyFlow = String(tx.money_flow ?? "").trim();
+        const tabType = String(tx.transaction_tab_type ?? "").trim();
+        const description = String(tx.txn_title ?? tx.description ?? tx.reason ?? "Movimento Carteira Shopee").trim();
+        // Chave estável do evento: status e saldo corrente podem mudar entre leituras;
+        // não podem criar uma segunda transação financeira para o mesmo evento.
+        const externalKey = crypto.createHash("sha256").update([
+          config.shopId, createTime, transactionType, withdrawalId, rootWithdrawalId, orderSn, refundSn,
+          amount, transactionFee, moneyFlow, tabType, description,
+        ].join("|")).digest("hex");
+
+        const { error } = await admin.rpc("record_shopee_wallet_transaction", {
+          p_user_id: userId,
+          p_shop_id: config.shopId!,
+          p_external_key: externalKey,
+          p_status: status,
+          p_transaction_type: transactionType,
+          p_money_flow: moneyFlow || null,
+          p_amount: amount,
+          p_current_balance: currentBalance,
+          p_transaction_fee: transactionFee,
+          p_occurred_at: saoPauloDateFromUnix(createTime),
+          p_create_time: createTime,
+          p_order_sn: orderSn || null,
+          p_refund_sn: refundSn || null,
+          p_withdrawal_id: withdrawalId || null,
+          p_root_withdrawal_id: rootWithdrawalId || null,
+          p_transaction_tab_type: tabType || null,
+          p_description: description,
+          p_raw: tx,
+        });
+        if (error) throw error;
+        processed += 1;
+      }
+
+      if (response.more !== true) break;
+      pageNo += transactions.length || 100;
+      if (page === MAX_LIST_PAGES_PER_WINDOW - 1) throw new Error("Limite de paginação da carteira Shopee atingido");
+    }
+    cursorFrom = cursorTo + 1;
+  }
+  return processed;
 }
 
 async function saveFees(formData: FormData) {
@@ -545,7 +672,7 @@ async function syncRecentShopee() {
   "use server";
   const { user } = await requireUser();
   let config = await readShopeeConfig(user.id);
-  if (!config?.shopId || !config.refreshToken) redirect(qs("Conecte a Shopee primeiro.", "error"));
+  if (!config?.shopId || !config.refreshToken) return redirect(qs("Conecte a Shopee primeiro.", "error"));
 
   let message = "";
   let errorMessage = "";
@@ -560,13 +687,18 @@ async function syncRecentShopee() {
     const nowMap = Object.fromEntries(nowParts.map((part) => [part.type, part.value]));
     const firstDayThisMonth = saoPauloMidnightUnix(Number(nowMap.year), Number(nowMap.month), 1);
     const from = config.lastSyncAt ? Math.max(0, Math.floor(config.lastSyncAt / 1000) - 3600) : firstDayThisMonth;
-    const imported = await syncRange(user.id, config, from, now, "update_time");
+    const orders = await syncRange(user.id, config, from, now, "update_time");
+    const reconciled = await reconcileCompletedEscrow(user.id, config, orders.completedOrderSns);
+    const wallet = await syncWalletRange(user.id, config, from, now);
     await writeShopeeConfig(user.id, { ...config, lastSyncAt: Date.now() });
     revalidatePath("/dashboard");
     revalidatePath("/vendas");
     revalidatePath("/produtos");
+    revalidatePath("/fluxo-caixa");
+    revalidatePath("/contas-pagar");
+    revalidatePath("/resumo");
     revalidatePath("/configuracoes");
-    message = `Shopee sincronizada: ${imported} pedido(s) processado(s).`;
+    message = `Shopee sincronizada: ${orders.imported} pedido(s), ${reconciled} liquidação(ões) conciliada(s) e ${wallet} movimento(s) de carteira processado(s).`;
   } catch (error) {
     errorMessage = error instanceof Error ? error.message : "Falha ao sincronizar a Shopee.";
   }
@@ -598,18 +730,23 @@ async function syncShopeeMonth(formData: FormData) {
   const to = Math.min(nextStart - 1, now);
 
   let config = await readShopeeConfig(user.id);
-  if (!config?.shopId || !config.refreshToken) redirect(qs("Conecte a Shopee primeiro.", "error"));
+  if (!config?.shopId || !config.refreshToken) return redirect(qs("Conecte a Shopee primeiro.", "error"));
 
   let message = "";
   let errorMessage = "";
   try {
     config = await refreshShopeeToken(user.id, config);
-    const imported = await syncRange(user.id, config, from, to, "create_time");
+    const orders = await syncRange(user.id, config, from, to, "create_time");
+    const reconciled = await reconcileCompletedEscrow(user.id, config, orders.completedOrderSns);
+    const wallet = await syncWalletRange(user.id, config, from, to);
     revalidatePath("/dashboard");
     revalidatePath("/vendas");
     revalidatePath("/produtos");
+    revalidatePath("/fluxo-caixa");
+    revalidatePath("/contas-pagar");
+    revalidatePath("/resumo");
     revalidatePath("/configuracoes");
-    message = `Mês ${month} importado: ${imported} pedido(s) processado(s).`;
+    message = `Mês ${month}: ${orders.imported} pedido(s), ${reconciled} liquidação(ões) conciliada(s) e ${wallet} movimento(s) de carteira processado(s).`;
   } catch (error) {
     errorMessage = error instanceof Error ? error.message : "Falha ao importar o mês da Shopee.";
   }
@@ -712,10 +849,10 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
   const callbackShopId = first(params.shop_id);
   if (callbackCode || callbackShopId) {
     if (!callbackCode || !callbackShopId || !/^\d+$/.test(callbackShopId)) {
-      redirect(qs("Retorno da Shopee incompleto.", "error"));
+      return redirect(qs("Retorno da Shopee incompleto.", "error"));
     }
     const current = await readShopeeConfig(user.id);
-    if (!current) redirect(qs("Partner ID/Partner Key não encontrados. Conecte novamente.", "error"));
+    if (!current) return redirect(qs("Partner ID/Partner Key não encontrados. Conecte novamente.", "error"));
     let callbackError = "";
     try {
       const connected = await exchangeShopeeCode(current, callbackCode, callbackShopId);
@@ -779,13 +916,13 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
         <CardContent className="space-y-3">
           <form action={saveFees} className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
             <div><Label htmlFor="shopee_commission_percent">Comissão (%)</Label><Input id="shopee_commission_percent" name="shopee_commission_percent" inputMode="decimal" min="0" max="100" step="0.0001" defaultValue={fees.shopee_commission_percent ?? "20.0000"} required /></div>
-            <div><Label htmlFor="shopee_fixed_fee">Taxa fixa / pedido (R$)</Label><Input id="shopee_fixed_fee" name="shopee_fixed_fee" inputMode="decimal" min="0" step="0.01" defaultValue={fees.shopee_fixed_fee ?? "0.00"} required /></div>
+            <div><Label htmlFor="shopee_fixed_fee">Taxa fixa / unidade vendida (R$)</Label><Input id="shopee_fixed_fee" name="shopee_fixed_fee" inputMode="decimal" min="0" step="0.01" defaultValue={fees.shopee_fixed_fee ?? "5.00"} required /></div>
             <div><Label htmlFor="filament_price_per_kg">Filamento (R$ / kg)</Label><Input id="filament_price_per_kg" name="filament_price_per_kg" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.filament_price_per_kg ?? "0.0000"} required /></div>
             <div><Label htmlFor="energy_price_per_kwh">Energia (R$ / kWh)</Label><Input id="energy_price_per_kwh" name="energy_price_per_kwh" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.energy_price_per_kwh ?? "0.0000"} required /></div>
             <div><Label htmlFor="default_printer_power_watts">Potência padrão (W)</Label><Input id="default_printer_power_watts" name="default_printer_power_watts" inputMode="decimal" min="0" step="0.01" defaultValue={fees.default_printer_power_watts ?? "0.0000"} required /></div>
             <div><Label htmlFor="default_packaging_cost">Embalagem padrão / un. (R$)</Label><Input id="default_packaging_cost" name="default_packaging_cost" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.default_packaging_cost ?? "0.0000"} required /></div>
             <div className="md:col-span-3 xl:col-span-6">
-              <p className="mb-3 text-xs text-muted-foreground">O custo de filamento é calculado por gramas de cada variação. Energia = horas de impressão × potência em W ÷ 1000 × R$/kWh.</p>
+              <p className="mb-3 text-xs text-muted-foreground">Shopee: a comissão percentual é calculada por unidade e a taxa fixa é multiplicada pela quantidade vendida; o frete não entra na base configurada. Produção: filamento por gramas e energia = horas × W ÷ 1000 × R$/kWh.</p>
               <Button type="submit">Salvar e recalcular vendas</Button>
             </div>
           </form>
@@ -804,7 +941,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <form action={syncRecentShopee}><Button type="submit">Sincronizar agora</Button></form>
+                <form action={syncRecentShopee}><Button type="submit">Sincronizar pedidos + financeiro</Button></form>
                 <form action={disconnectShopee}><Button type="submit" variant="outline">Remover conexão</Button></form>
               </div>
 
@@ -813,7 +950,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
                   <Label htmlFor="month">Importar/reimportar um mês</Label>
                   <Input id="month" name="month" type="month" max={currentMonth} defaultValue={currentMonth} required />
                 </div>
-                <div><Button type="submit" variant="outline">Importar mês da Shopee</Button></div>
+                <div><Button type="submit" variant="outline">Importar mês + financeiro</Button></div>
               </form>
             </>
           ) : (

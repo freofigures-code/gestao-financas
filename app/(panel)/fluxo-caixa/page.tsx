@@ -3,187 +3,109 @@
 import Decimal from "decimal.js";
 import { useMonth } from "@/components/month-provider";
 import { useCashflow } from "@/hooks/use-cashflow";
+import { useMonthSummary } from "@/hooks/use-month-summary";
 import { CashEntryForm } from "@/components/cash-entry-form";
+import { MetricCard } from "@/components/metric-card";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatBRL } from "@/lib/money";
 import { Table, THead, TBody, TR, TH, TD } from "@/components/ui/table";
-import { useCustomColumns } from "@/hooks/use-custom-columns";
-import { EntryActions } from "@/components/entry-actions";
+import { formatBRL } from "@/lib/money";
 
-const PAYMENT_METHOD_LABELS: Record<string, string> = {
-  credit: "Crédito",
-  installment: "A prazo",
-  debit: "Débito",
-  pix: "Pix",
+const KIND_LABELS: Record<string, string> = {
+  operating: "Operacional",
+  transfer: "Transferência",
+  capital: "Capital",
 };
+
+function accountOf(row: any) {
+  return Array.isArray(row.cash_accounts) ? row.cash_accounts[0] : row.cash_accounts;
+}
 
 export default function Fluxo() {
   const { month } = useMonth();
-  const { sales, income, expenses, loading, refresh } = useCashflow(month);
-  const incomeCols = useCustomColumns("income");
-  const expenseCols = useCustomColumns("expenses");
-  const salesTotal = sales.reduce(
-    (total: Decimal, sale: any) => total.plus(sale.shopee_net_total),
-    new Decimal(0),
-  );
-  const inTotal = income.reduce(
-    (total: Decimal, entry: any) => total.plus(entry.amount),
-    new Decimal(0),
-  );
-  const outTotal = expenses.reduce(
-    (total: Decimal, entry: any) => total.plus(entry.amount),
-    new Decimal(0),
-  );
-  const balance = salesTotal.plus(inTotal).minus(outTotal);
+  const { movements, loading, error, refresh } = useCashflow(month);
+  const { summary } = useMonthSummary(month);
 
-  const rows = [
-    ...sales.map((sale: any) => ({
-      id: `sale-${sale.id}`,
-      kind: "sale",
-      type: "Venda líquida",
-      date: sale.sold_at,
-      cat: "Shopee",
-      desc: sale.order_sn,
-      paymentMethod: "—",
-      val: sale.shopee_net_total,
-      custom: {},
-    })),
-    ...income.map((entry: any) => ({
-      id: entry.id,
-      kind: "income",
-      type: "Entrada",
-      date: entry.received_at,
-      cat: entry.categories?.name,
-      desc: entry.description,
-      paymentMethod: "—",
-      val: entry.amount,
-      custom: entry.custom_fields ?? {},
-      raw: entry,
-    })),
-    ...expenses.map((entry: any) => ({
-      id: entry.id,
-      kind: "expense",
-      type: "Saída",
-      date: entry.spent_at,
-      cat: entry.categories?.name,
-      desc: entry.description,
-      paymentMethod: PAYMENT_METHOD_LABELS[entry.payment_method] ?? "Não informado",
-      val: `-${entry.amount}`,
-      custom: entry.custom_fields ?? {},
-      raw: entry,
-    })),
-  ].sort((a, b) => b.date.localeCompare(a.date));
+  const operatingIn = movements.reduce(
+    (sum: Decimal, row: any) => row.direction === "in" && row.movement_kind !== "transfer" ? sum.plus(row.amount) : sum,
+    new Decimal(0),
+  );
+  const operatingOut = movements.reduce(
+    (sum: Decimal, row: any) => row.direction === "out" && row.movement_kind !== "transfer" ? sum.plus(row.amount) : sum,
+    new Decimal(0),
+  );
+  const cashResult = operatingIn.minus(operatingOut);
+  const bankNet = movements.reduce((sum: Decimal, row: any) => {
+    const account = accountOf(row);
+    if (account?.kind !== "bank") return sum;
+    return row.direction === "in" ? sum.plus(row.amount) : sum.minus(row.amount);
+  }, new Decimal(0));
 
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-2xl font-bold">Fluxo de Caixa</h1>
+        <h1 className="text-2xl font-bold">Fluxo de Caixa Real</h1>
         <p className="text-sm text-muted-foreground">
-          Entradas = vendas pagas pelo líquido Shopee + outras entradas. Saídas = lançamentos efetivos do mês.
+          Aqui entra somente dinheiro que realmente movimentou uma conta. Venda da Shopee não vira caixa até a liberação na Carteira Shopee; saque é transferência para o banco, não nova receita.
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <MetricCard label="Entradas reais" value={formatBRL(operatingIn.toFixed(2))} />
+        <MetricCard label="Saídas reais" value={formatBRL(operatingOut.toFixed(2))} />
+        <MetricCard label="Resultado do caixa" value={formatBRL(cashResult.toFixed(2))} />
+        <MetricCard label="Movimento líquido no banco" value={formatBRL(bankNet.toFixed(2))} />
+        <MetricCard label="Saldo Carteira Shopee" value={formatBRL(summary?.shopee_wallet_balance ?? "0")} />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
         <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Entradas</CardTitle>
-          </CardHeader>
-          <CardContent className="text-2xl font-bold">{formatBRL(salesTotal.plus(inTotal))}</CardContent>
+          <CardHeader><CardTitle>Nova entrada manual</CardTitle></CardHeader>
+          <CardContent><CashEntryForm type="income" month={month} onDone={refresh} /></CardContent>
         </Card>
         <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Saídas</CardTitle>
-          </CardHeader>
-          <CardContent className="text-2xl font-bold">{formatBRL(outTotal)}</CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Saldo do mês</CardTitle>
-          </CardHeader>
-          <CardContent className="text-2xl font-bold">{formatBRL(balance)}</CardContent>
+          <CardHeader><CardTitle>Nova compra / saída</CardTitle></CardHeader>
+          <CardContent><CashEntryForm type="expense" month={month} onDone={refresh} /></CardContent>
         </Card>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Nova entrada manual</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <CashEntryForm type="income" month={month} onDone={refresh} />
-        </CardContent>
-      </Card>
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
       <Card>
-        <CardHeader>
-          <CardTitle>Nova saída manual</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <CashEntryForm type="expense" month={month} onDone={refresh} />
-        </CardContent>
-      </Card>
-
-      <Table>
-        <THead>
-          <TR>
-            <TH>Tipo</TH>
-            <TH>Data</TH>
-            <TH>Categoria</TH>
-            <TH>Descrição</TH>
-            <TH>Forma de pagamento</TH>
-            <TH>Valor</TH>
-            {incomeCols.map((column) => (
-              <TH key={`i-${column.id}`}>{column.label} (entrada)</TH>
-            ))}
-            {expenseCols.map((column) => (
-              <TH key={`e-${column.id}`}>{column.label} (saída)</TH>
-            ))}
-            <TH>Ações</TH>
-          </TR>
-        </THead>
-        <TBody>
-          {loading ? (
-            <TR>
-              <TD colSpan={7 + incomeCols.length + expenseCols.length}>Carregando...</TD>
-            </TR>
-          ) : rows.length === 0 ? (
-            <TR>
-              <TD colSpan={7 + incomeCols.length + expenseCols.length} className="text-muted-foreground">
-                Nenhum lançamento neste mês.
-              </TD>
-            </TR>
-          ) : (
-            rows.map((row: any) => (
-              <TR key={row.id}>
-                <TD>{row.type}</TD>
-                <TD>{new Date(`${row.date}T12:00:00`).toLocaleDateString("pt-BR")}</TD>
-                <TD>{row.cat}</TD>
-                <TD>{row.desc}</TD>
-                <TD>{row.paymentMethod}</TD>
-                <TD>{formatBRL(row.val)}</TD>
-                {incomeCols.map((column) => (
-                  <TD key={`i-${column.id}`}>
-                    {row.kind === "income" ? String(row.custom[column.key] ?? "—") : "—"}
-                  </TD>
-                ))}
-                {expenseCols.map((column) => (
-                  <TD key={`e-${column.id}`}>
-                    {row.kind === "expense" ? String(row.custom[column.key] ?? "—") : "—"}
-                  </TD>
-                ))}
-                <TD>
-                  {row.kind === "income" ? (
-                    <EntryActions type="income" entry={row.raw} onDone={refresh} />
-                  ) : row.kind === "expense" ? (
-                    <EntryActions type="expense" entry={row.raw} onDone={refresh} />
-                  ) : (
-                    <span className="text-xs text-muted-foreground">Edite em Vendas</span>
-                  )}
-                </TD>
+        <CardHeader><CardTitle>Movimentos efetivos do mês</CardTitle></CardHeader>
+        <CardContent className="overflow-x-auto p-0">
+          <Table>
+            <THead>
+              <TR>
+                <TH>Data</TH>
+                <TH>Conta</TH>
+                <TH>Tipo</TH>
+                <TH>Descrição</TH>
+                <TH>Entrada</TH>
+                <TH>Saída</TH>
               </TR>
-            ))
-          )}
-        </TBody>
-      </Table>
+            </THead>
+            <TBody>
+              {loading ? (
+                <TR><TD colSpan={6}>Carregando...</TD></TR>
+              ) : movements.length === 0 ? (
+                <TR><TD colSpan={6} className="text-muted-foreground">Nenhum movimento real neste mês.</TD></TR>
+              ) : movements.map((row: any) => {
+                const account = accountOf(row);
+                return (
+                  <TR key={row.id}>
+                    <TD>{new Date(`${row.occurred_at}T12:00:00`).toLocaleDateString("pt-BR")}</TD>
+                    <TD>{account?.name ?? "—"}</TD>
+                    <TD>{KIND_LABELS[row.movement_kind] ?? row.movement_kind}</TD>
+                    <TD>{row.description}</TD>
+                    <TD className="font-medium">{row.direction === "in" ? formatBRL(row.amount) : "—"}</TD>
+                    <TD className="font-medium">{row.direction === "out" ? formatBRL(row.amount) : "—"}</TD>
+                  </TR>
+                );
+              })}
+            </TBody>
+          </Table>
+        </CardContent>
+      </Card>
     </div>
   );
 }
