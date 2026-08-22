@@ -9,4 +9,15 @@ export interface MonthSummary {
 export interface DailySale { day: string; gross_total: Numeric; net_total: Numeric; profit_total: Numeric; }
 export interface TopProduct { product_id: UUID; product_name: string; quantity: number; revenue: Numeric; }
 export interface Product { id: UUID; name: string; description: string | null; active: boolean; custom_fields: Record<string, unknown>; }
-export interface ProductVariant { id: UUID; product_id: UUID; name: string; sku: string | null; filament_cost: Numeric | null; energy_cost: Numeric | null; packaging_cost: Numeric | null; stock_min_override: number | null; stock_ideal_override: number | null; }
+export interface ProductVariant {
+  id: UUID;
+  product_id: UUID;
+  name: string;
+  sku: string | null;
+  filament_grams: Numeric | null;
+  print_time_hours: Numeric | null;
+  printer_power_watts: Numeric | null;
+  packaging_cost: Numeric | null;
+  stock_min_override: number | null;
+  stock_ideal_override: number | null;
+}
