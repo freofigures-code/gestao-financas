@@ -33,6 +33,7 @@ type ShopeeConfig = {
   refreshToken?: string;
   accessTokenExpiresAt?: number;
   lastSyncAt?: number;
+  lastWalletSyncAt?: number;
 };
 
 type ShopeeOrderItem = {
@@ -129,6 +130,7 @@ function parseShopeeConfig(ciphertext: string | null | undefined): ShopeeConfig 
       refreshToken: parsed.refreshToken ? String(parsed.refreshToken) : undefined,
       accessTokenExpiresAt: Number.isFinite(parsed.accessTokenExpiresAt) ? Number(parsed.accessTokenExpiresAt) : undefined,
       lastSyncAt: Number.isFinite(parsed.lastSyncAt) ? Number(parsed.lastSyncAt) : undefined,
+      lastWalletSyncAt: Number.isFinite(parsed.lastWalletSyncAt) ? Number(parsed.lastWalletSyncAt) : undefined,
     };
   } catch {
     return null;
@@ -686,11 +688,17 @@ async function syncRecentShopee() {
     }).formatToParts(new Date());
     const nowMap = Object.fromEntries(nowParts.map((part) => [part.type, part.value]));
     const firstDayThisMonth = saoPauloMidnightUnix(Number(nowMap.year), Number(nowMap.month), 1);
-    const from = config.lastSyncAt ? Math.max(0, Math.floor(config.lastSyncAt / 1000) - 3600) : firstDayThisMonth;
-    const orders = await syncRange(user.id, config, from, now, "update_time");
+    const ordersFrom = config.lastSyncAt ? Math.max(0, Math.floor(config.lastSyncAt / 1000) - 3600) : firstDayThisMonth;
+    // O financeiro tem cursor próprio. Assim, quem já sincronizava pedidos antes da migration
+    // recebe automaticamente o histórico financeiro do mês atual na primeira sincronização.
+    const walletFrom = config.lastWalletSyncAt
+      ? Math.max(0, Math.floor(config.lastWalletSyncAt / 1000) - 3600)
+      : firstDayThisMonth;
+    const orders = await syncRange(user.id, config, ordersFrom, now, "update_time");
     const reconciled = await reconcileCompletedEscrow(user.id, config, orders.completedOrderSns);
-    const wallet = await syncWalletRange(user.id, config, from, now);
-    await writeShopeeConfig(user.id, { ...config, lastSyncAt: Date.now() });
+    const wallet = await syncWalletRange(user.id, config, walletFrom, now);
+    const syncedAt = Date.now();
+    await writeShopeeConfig(user.id, { ...config, lastSyncAt: syncedAt, lastWalletSyncAt: syncedAt });
     revalidatePath("/dashboard");
     revalidatePath("/vendas");
     revalidatePath("/produtos");
