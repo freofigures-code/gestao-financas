@@ -490,8 +490,9 @@ async function saveFees(formData: FormData) {
     p_user_id: user.id,
     p_commission: text(formData, "shopee_commission_percent").replace(",", "."),
     p_fixed_fee: text(formData, "shopee_fixed_fee").replace(",", "."),
-    p_default_filament: text(formData, "default_filament_cost").replace(",", "."),
-    p_default_energy: text(formData, "default_energy_cost").replace(",", "."),
+    p_filament_price_per_kg: text(formData, "filament_price_per_kg").replace(",", "."),
+    p_energy_price_per_kwh: text(formData, "energy_price_per_kwh").replace(",", "."),
+    p_default_printer_power_watts: text(formData, "default_printer_power_watts").replace(",", "."),
     p_default_packaging: text(formData, "default_packaging_cost").replace(",", "."),
   });
   if (error) redirect(qs(error.message, "error"));
@@ -719,7 +720,6 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
     try {
       const connected = await exchangeShopeeCode(current, callbackCode, callbackShopId);
       await writeShopeeConfig(user.id, connected);
-      revalidatePath("/configuracoes");
     } catch (error) {
       callbackError = error instanceof Error ? error.message : "Falha ao concluir autorização da Shopee.";
     }
@@ -773,15 +773,21 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
       ) : null}
 
       <Card>
-        <CardHeader><CardTitle>Taxas Shopee e custos padrão</CardTitle></CardHeader>
-        <CardContent>
-          <form action={saveFees} className="grid gap-3 md:grid-cols-5">
-            <div><Label htmlFor="shopee_commission_percent">Comissão (%)</Label><Input id="shopee_commission_percent" name="shopee_commission_percent" defaultValue={fees.shopee_commission_percent ?? "20.0000"} required /></div>
-            <div><Label htmlFor="shopee_fixed_fee">Taxa fixa por pedido</Label><Input id="shopee_fixed_fee" name="shopee_fixed_fee" defaultValue={fees.shopee_fixed_fee ?? "0.00"} required /></div>
-            <div><Label htmlFor="default_filament_cost">Filamento padrão / un.</Label><Input id="default_filament_cost" name="default_filament_cost" defaultValue={fees.default_filament_cost ?? "0.00"} required /></div>
-            <div><Label htmlFor="default_energy_cost">Energia padrão / un.</Label><Input id="default_energy_cost" name="default_energy_cost" defaultValue={fees.default_energy_cost ?? "0.00"} required /></div>
-            <div><Label htmlFor="default_packaging_cost">Embalagem padrão / un.</Label><Input id="default_packaging_cost" name="default_packaging_cost" defaultValue={fees.default_packaging_cost ?? "0.00"} required /></div>
-            <div className="md:col-span-5"><Button type="submit">Salvar e recalcular vendas</Button></div>
+        <CardHeader>
+          <CardTitle>Taxas Shopee e parâmetros de produção</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <form action={saveFees} className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+            <div><Label htmlFor="shopee_commission_percent">Comissão (%)</Label><Input id="shopee_commission_percent" name="shopee_commission_percent" inputMode="decimal" min="0" max="100" step="0.0001" defaultValue={fees.shopee_commission_percent ?? "20.0000"} required /></div>
+            <div><Label htmlFor="shopee_fixed_fee">Taxa fixa / pedido (R$)</Label><Input id="shopee_fixed_fee" name="shopee_fixed_fee" inputMode="decimal" min="0" step="0.01" defaultValue={fees.shopee_fixed_fee ?? "0.00"} required /></div>
+            <div><Label htmlFor="filament_price_per_kg">Filamento (R$ / kg)</Label><Input id="filament_price_per_kg" name="filament_price_per_kg" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.filament_price_per_kg ?? "0.0000"} required /></div>
+            <div><Label htmlFor="energy_price_per_kwh">Energia (R$ / kWh)</Label><Input id="energy_price_per_kwh" name="energy_price_per_kwh" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.energy_price_per_kwh ?? "0.0000"} required /></div>
+            <div><Label htmlFor="default_printer_power_watts">Potência padrão (W)</Label><Input id="default_printer_power_watts" name="default_printer_power_watts" inputMode="decimal" min="0" step="0.01" defaultValue={fees.default_printer_power_watts ?? "0.0000"} required /></div>
+            <div><Label htmlFor="default_packaging_cost">Embalagem padrão / un. (R$)</Label><Input id="default_packaging_cost" name="default_packaging_cost" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.default_packaging_cost ?? "0.0000"} required /></div>
+            <div className="md:col-span-3 xl:col-span-6">
+              <p className="mb-3 text-xs text-muted-foreground">O custo de filamento é calculado por gramas de cada variação. Energia = horas de impressão × potência em W ÷ 1000 × R$/kWh.</p>
+              <Button type="submit">Salvar e recalcular vendas</Button>
+            </div>
           </form>
         </CardContent>
       </Card>
