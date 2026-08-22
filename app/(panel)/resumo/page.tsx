@@ -23,6 +23,7 @@ export default function Resumo() {
   const summary = current.summary;
   if (!summary) return <p>Carregando...</p>;
   const prev = previous.summary;
+  const ordersCount = summary.orders_count;
 
   const rows: [string, string][] = [
     ["Faturamento bruto dos produtos", summary.gross_total],
@@ -40,7 +41,7 @@ export default function Resumo() {
   ];
 
   function csv() {
-    const text = "Indicador,Valor\n" + rows.map(([label, value]) => `"${label}",${value}`).join("\n") + `\n"Pedidos",${summary.orders_count}`;
+    const text = "Indicador,Valor\n" + rows.map(([label, value]) => `"${label}",${value}`).join("\n") + `\n"Pedidos",${ordersCount}`;
     const link = document.createElement("a");
     const url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
     link.href = url;
@@ -55,7 +56,7 @@ export default function Resumo() {
     doc.text(`Freo Figures - Resumo ${month}`, 14, 20);
     doc.setFontSize(11);
     rows.forEach(([label, value], index) => doc.text(`${label}: ${formatBRL(value)}`, 14, 35 + index * 8));
-    doc.text(`Pedidos: ${summary.orders_count}`, 14, 35 + rows.length * 8);
+    doc.text(`Pedidos: ${ordersCount}`, 14, 35 + rows.length * 8);
     doc.save(`resumo-${month}.pdf`);
   }
 
@@ -78,7 +79,7 @@ export default function Resumo() {
         <MetricCard label="Resultado do caixa" value={formatBRL(summary.cashflow_result)} />
         <MetricCard label="Contas a pagar" value={formatBRL(summary.payables_open_total)} />
         <MetricCard label="Carteira Shopee" value={formatBRL(summary.shopee_wallet_balance)} />
-        <MetricCard label="Pedidos" value={String(summary.orders_count)} sub={prev ? `${summary.orders_count - prev.orders_count} vs mês anterior` : undefined} />
+        <MetricCard label="Pedidos" value={String(ordersCount)} sub={prev ? `${ordersCount - prev.orders_count} vs mês anterior` : undefined} />
       </div>
     </div>
   );
