@@ -1,5 +1,5 @@
 import Decimal from "decimal.js";
-import { calculateSale } from "../lib/money";
+import { calculateProductionUnit, calculateSale } from "../lib/money";
 
 function eq(actual: Decimal, expected: string, label: string) {
   if (!actual.eq(expected)) {
@@ -25,4 +25,17 @@ eq(cents.taxas, "0.02", "taxas em centavos");
 eq(cents.liquido, "0.03", "líquido em centavos");
 eq(cents.lucro, "0.02", "lucro em centavos");
 
-console.log("OK: cálculos financeiros validados com Decimal.js");
+const production = calculateProductionUnit({
+  filamentPricePerKg: "93",
+  filamentGrams: "120",
+  energyPricePerKwh: "1.5",
+  printTimeHours: "5",
+  printerPowerWatts: "120",
+  packagingCost: "2",
+});
+eq(production.filamentCost, "11.16", "custo de 120g a R$ 93/kg");
+eq(production.energyCost, "0.9", "energia 120W x 5h a R$ 1,50/kWh");
+eq(production.packagingCost, "2", "embalagem por unidade");
+eq(production.productionCost, "14.06", "custo total de produção por unidade");
+
+console.log("OK: cálculos financeiros e de produção validados com Decimal.js");
