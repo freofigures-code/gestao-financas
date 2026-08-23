@@ -14,7 +14,7 @@ import { Table, THead, TBody, TR, TH, TD } from "@/components/ui/table";
 import { createClient } from "@/lib/supabase/client";
 import { formatBRL } from "@/lib/money";
 import { toast } from "sonner";
-import { nextMonthStart } from "@/lib/date";
+import { monthStart, nextMonthStart } from "@/lib/date";
 
 type BankAccount = {
   id: string;
@@ -27,25 +27,33 @@ function accountOf(row: any) {
   return Array.isArray(row.cash_accounts) ? row.cash_accounts[0] : row.cash_accounts;
 }
 
-function metadataOf(row: any): Record<string, unknown> {
-  return row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
-}
+type ShopeeWalletEntry = {
+  id: string;
+  occurred_at: string;
+  create_time: number;
+  amount: string | number;
+  order_sn: string | null;
+  status: string;
+  money_flow: string | null;
+  transaction_type: string;
+  transaction_tab_type: string | null;
+};
 
 function formatDate(value: string) {
   return new Date(`${value}T12:00:00`).toLocaleDateString("pt-BR");
 }
 
-function isShopeeSaleEntry(row: any) {
-  const account = accountOf(row);
-  const metadata = metadataOf(row);
-  const tab = String(metadata.tab ?? "").toLowerCase();
-  const transactionType = String(metadata.transaction_type ?? "").toUpperCase();
+function isShopeeSaleEntry(row: ShopeeWalletEntry) {
+  const status = String(row.status ?? "").toUpperCase();
+  const flow = String(row.money_flow ?? "").toUpperCase();
+  const tab = String(row.transaction_tab_type ?? "").toLowerCase();
+  const transactionType = String(row.transaction_type ?? "").toUpperCase();
+  const amount = new Decimal(String(row.amount ?? 0));
 
   return (
-    row.source_type === "shopee_wallet" &&
-    row.direction === "in" &&
-    row.movement_kind !== "transfer" &&
-    account?.kind === "shopee_wallet" &&
+    status === "COMPLETED" &&
+    flow === "MONEY_IN" &&
+    amount.greaterThan(0) &&
     (
       tab === "wallet_order_income" ||
       transactionType === "101" ||
@@ -58,9 +66,8 @@ function isRegisteredPaidExpense(row: any) {
   return row.source_type === "expense_installment" && row.direction === "out";
 }
 
-function shopeeEntryDescription(row: any) {
-  const metadata = metadataOf(row);
-  const orderSn = String(metadata.order_sn ?? "").trim();
+function shopeeEntryDescription(row: ShopeeWalletEntry) {
+  const orderSn = String(row.order_sn ?? "").trim();
   return orderSn ? `Pedido ${orderSn}` : "Venda liberada pela Shopee";
 }
 
@@ -133,10 +140,13 @@ export default function Fluxo() {
   const [selectedBankAccountId, setSelectedBankAccountId] = useState("");
   const [openingBalanceInput, setOpeningBalanceInput] = useState("0.00");
   const [savingOpeningBalance, setSavingOpeningBalance] = useState(false);
+  const [walletEntries, setWalletEntries] = useState<ShopeeWalletEntry[]>([]);
+  const [walletEntriesLoading, setWalletEntriesLoading] = useState(true);
+  const [walletEntriesError, setWalletEntriesError] = useState<string | null>(null);
 
   const shopeeEntries = useMemo(
-    () => movements.filter((row: any) => isShopeeSaleEntry(row)),
-    [movements],
+    () => walletEntries.filter((row) => isShopeeSaleEntry(row)),
+    [walletEntries],
   );
 
   const registeredPaidExpenses = useMemo(
@@ -155,6 +165,40 @@ export default function Fluxo() {
     () => registeredPaidExpenses.reduce((sum: Decimal, row: any) => sum.plus(row.amount), new Decimal(0)),
     [registeredPaidExpenses],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadWalletEntries() {
+      setWalletEntriesLoading(true);
+      setWalletEntriesError(null);
+      const supabase = createClient();
+
+      const result = await supabase
+        .from("shopee_wallet_transactions")
+        .select("id,occurred_at,create_time,amount,order_sn,status,money_flow,transaction_type,transaction_tab_type")
+        .gte("occurred_at", monthStart(month))
+        .lt("occurred_at", nextMonthStart(month))
+        .order("create_time", { ascending: false });
+
+      if (cancelled) return;
+
+      if (result.error) {
+        setWalletEntries([]);
+        setWalletEntriesError(result.error.message);
+        setWalletEntriesLoading(false);
+        return;
+      }
+
+      setWalletEntries((result.data ?? []) as ShopeeWalletEntry[]);
+      setWalletEntriesLoading(false);
+    }
+
+    void loadWalletEntries();
+    return () => {
+      cancelled = true;
+    };
+  }, [month, positionRefreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -354,6 +398,7 @@ export default function Fluxo() {
       </div>
 
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      {walletEntriesError ? <p className="text-sm text-destructive">{walletEntriesError}</p> : null}
 
       <div className="grid gap-4 xl:grid-cols-2">
         <Card>
@@ -373,7 +418,7 @@ export default function Fluxo() {
                 </TR>
               </THead>
               <TBody>
-                {loading ? (
+                {walletEntriesLoading ? (
                   <TR><TD colSpan={3}>Carregando entradas...</TD></TR>
                 ) : shopeeEntries.length === 0 ? (
                   <TR><TD colSpan={3} className="text-muted-foreground">Nenhuma venda liberada na carteira neste mês.</TD></TR>
