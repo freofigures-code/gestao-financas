@@ -569,118 +569,217 @@ async function syncWalletRange(userId: string, config: ShopeeConfig, from: numbe
   let processed = 0;
   let completed = 0;
   let appliedToCash = 0;
+  let orderIncomeCount = 0;
+  let orderIncomeTotal = new Decimal(0);
+  let latestBalance: string | null = null;
+  let latestBalanceCreateTime = 0;
   let cursorFrom = from;
+
+  function withdrawalPriority(raw: Record<string, unknown>) {
+    const type = String(raw.transaction_type ?? "").trim().toUpperCase();
+    if (type === "201" || type === "WITHDRAWAL_CREATED" || type === "WITHDRAW_CREATED") return 0;
+    if (
+      type === "202" ||
+      type === "203" ||
+      type === "WITHDRAWAL_COMPLETED" ||
+      type === "WITHDRAW_COMPLETED" ||
+      type === "WITHDRAWAL_CANCELLED" ||
+      type === "WITHDRAWAL_CANCELED" ||
+      type === "WITHDRAW_CANCELLED" ||
+      type === "WITHDRAW_CANCELED"
+    ) return 2;
+    return 1;
+  }
 
   while (cursorFrom <= to) {
     const cursorTo = Math.min(to, cursorFrom + WINDOW_SECONDS - 1);
-    let pageNo = 1;
+    const windowTransactions: Record<string, unknown>[] = [];
+    let paginationOffset = 0;
 
     for (let page = 0; page < MAX_LIST_PAGES_PER_WINDOW; page += 1) {
       const body = await shopeePost(config, SHOPEE_WALLET_TX_PATH, {
-        page_no: pageNo,
+        // Na API da Shopee este campo é o índice inicial/offset e começa em 0.
+        page_no: paginationOffset,
         page_size: 100,
         create_time_from: cursorFrom,
         create_time_to: cursorTo,
       });
+
       const response = body.response && typeof body.response === "object"
         ? body.response as Record<string, unknown>
         : null;
       if (!response) throw new Error("Resposta de get_wallet_transaction_list sem response");
 
-      const transactions = Array.isArray(response.transaction_list) ? response.transaction_list : [];
+      const transactions = Array.isArray(response.transaction_list)
+        ? response.transaction_list.filter(
+            (item): item is Record<string, unknown> => Boolean(item) && typeof item === "object",
+          )
+        : [];
 
-      for (const raw of transactions) {
-        if (!raw || typeof raw !== "object") continue;
-        const tx = raw as Record<string, unknown>;
-        const createTime = Number(tx.create_time);
-        if (!Number.isFinite(createTime) || createTime <= 0) {
-          throw new Error("Transação Shopee sem create_time válido");
-        }
-
-        const transactionType = String(tx.transaction_type ?? "").trim();
-        const status = String(tx.status ?? "").trim();
-        if (!transactionType || !status) throw new Error("Transação Shopee sem status/tipo");
-
-        const withdrawalId = tx.withdrawal_id == null ? "" : String(tx.withdrawal_id);
-        const rootWithdrawalId = tx.root_withdrawal_id == null ? "" : String(tx.root_withdrawal_id);
-        const orderSn = String(tx.order_sn ?? "").trim();
-        const refundSn = String(tx.refund_sn ?? "").trim();
-        const amount = signedMoney(tx.amount, "Valor da transação da carteira");
-        const currentBalance = optionalMoney(tx.current_balance);
-        const transactionFee = optionalMoney(tx.transaction_fee) ?? "0.00";
-        const moneyFlow = String(tx.money_flow ?? "").trim();
-        const tabType = String(tx.transaction_tab_type ?? "").trim();
-        const description = String(tx.txn_title ?? tx.description ?? tx.reason ?? "Movimento Carteira Shopee").trim();
-
-        // O status e o saldo podem mudar entre leituras. Eles não entram na chave,
-        // impedindo que a mesma transação vire um segundo movimento de caixa.
-        const externalKey = crypto.createHash("sha256").update([
-          config.shopId,
-          createTime,
-          transactionType,
-          withdrawalId,
-          rootWithdrawalId,
-          orderSn,
-          refundSn,
-          amount,
-          transactionFee,
-          moneyFlow,
-          tabType,
-          description,
-        ].join("|")).digest("hex");
-
-        const { data: recorded, error } = await admin.rpc("record_shopee_wallet_transaction", {
-          p_user_id: userId,
-          p_shop_id: config.shopId!,
-          p_external_key: externalKey,
-          p_status: status,
-          p_transaction_type: transactionType,
-          p_money_flow: moneyFlow || null,
-          p_amount: amount,
-          p_current_balance: currentBalance,
-          p_transaction_fee: transactionFee,
-          p_occurred_at: saoPauloDateFromUnix(createTime),
-          p_create_time: createTime,
-          p_order_sn: orderSn || null,
-          p_refund_sn: refundSn || null,
-          p_withdrawal_id: withdrawalId || null,
-          p_root_withdrawal_id: rootWithdrawalId || null,
-          p_transaction_tab_type: tabType || null,
-          p_description: description,
-          p_raw: tx,
-        });
-        if (error) throwSupabaseError("record_shopee_wallet_transaction", error);
-
-        processed += 1;
-        const normalizedStatus = status.toUpperCase();
-        const normalizedFlow = moneyFlow.toUpperCase();
-        if (normalizedStatus === "COMPLETED") completed += 1;
-        if (recorded === true) appliedToCash += 1;
-
-        // Uma transação concluída que a própria Shopee marcou como entrada/saída deve
-        // virar movimento. Se o RPC a ignorar, paramos aqui e mostramos os dados exatos.
-        if (
-          normalizedStatus === "COMPLETED" &&
-          (normalizedFlow === "MONEY_IN" || normalizedFlow === "MONEY_OUT") &&
-          recorded !== true
-        ) {
-          throw new Error(
-            `Transação concluída da Carteira Shopee não virou caixa: type=${transactionType}, money_flow=${moneyFlow}, amount=${amount}, order_sn=${orderSn || "sem pedido"}`,
-          );
-        }
-      }
+      windowTransactions.push(...transactions);
 
       if (response.more !== true) break;
-      pageNo += 1;
+
+      if (transactions.length === 0) {
+        throw new Error(
+          `Shopee informou more=true sem retornar transações (offset=${paginationOffset}).`,
+        );
+      }
+
+      // page_no é offset, não número sequencial de página.
+      paginationOffset += transactions.length;
+
       if (page === MAX_LIST_PAGES_PER_WINDOW - 1) {
         throw new Error("Limite de paginação da carteira Shopee atingido");
+      }
+    }
+
+    // A Shopee pode devolver a carteira do mais novo para o mais antigo.
+    // Processamos cronologicamente para que WITHDRAWAL_CREATED (201) exista no
+    // banco antes de WITHDRAWAL_COMPLETED/CANCELLED (202/203), que pode vir amount=0.
+    windowTransactions.sort((left, right) => {
+      const leftTime = Number(left.create_time) || 0;
+      const rightTime = Number(right.create_time) || 0;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return withdrawalPriority(left) - withdrawalPriority(right);
+    });
+
+    const seenKeys = new Set<string>();
+
+    for (const tx of windowTransactions) {
+      const createTime = Number(tx.create_time);
+      if (!Number.isFinite(createTime) || createTime <= 0) {
+        throw new Error("Transação Shopee sem create_time válido");
+      }
+
+      const transactionType = String(tx.transaction_type ?? "").trim();
+      const status = String(tx.status ?? "").trim();
+      if (!transactionType || !status) throw new Error("Transação Shopee sem status/tipo");
+
+      const withdrawalId = tx.withdrawal_id == null ? "" : String(tx.withdrawal_id);
+      const rootWithdrawalId = tx.root_withdrawal_id == null ? "" : String(tx.root_withdrawal_id);
+      const orderSn = String(tx.order_sn ?? "").trim();
+      const refundSn = String(tx.refund_sn ?? "").trim();
+      const amount = signedMoney(tx.amount, "Valor da transação da carteira");
+      const currentBalance = optionalMoney(tx.current_balance);
+      const transactionFee = optionalMoney(tx.transaction_fee) ?? "0.00";
+      const moneyFlow = String(tx.money_flow ?? "").trim();
+      const tabType = String(tx.transaction_tab_type ?? "").trim();
+      const description = String(
+        tx.txn_title ?? tx.description ?? tx.reason ?? "Movimento Carteira Shopee",
+      ).trim();
+
+      const externalKey = crypto.createHash("sha256").update([
+        config.shopId,
+        createTime,
+        transactionType,
+        withdrawalId,
+        rootWithdrawalId,
+        orderSn,
+        refundSn,
+        amount,
+        transactionFee,
+        moneyFlow,
+        tabType,
+        description,
+      ].join("|")).digest("hex");
+
+      // Proteção contra qualquer sobreposição inesperada da paginação da Shopee.
+      if (seenKeys.has(externalKey)) continue;
+      seenKeys.add(externalKey);
+
+      const { data: recorded, error } = await admin.rpc("record_shopee_wallet_transaction", {
+        p_user_id: userId,
+        p_shop_id: config.shopId!,
+        p_external_key: externalKey,
+        p_status: status,
+        p_transaction_type: transactionType,
+        p_money_flow: moneyFlow || null,
+        p_amount: amount,
+        p_current_balance: currentBalance,
+        p_transaction_fee: transactionFee,
+        p_occurred_at: saoPauloDateFromUnix(createTime),
+        p_create_time: createTime,
+        p_order_sn: orderSn || null,
+        p_refund_sn: refundSn || null,
+        p_withdrawal_id: withdrawalId || null,
+        p_root_withdrawal_id: rootWithdrawalId || null,
+        p_transaction_tab_type: tabType || null,
+        p_description: description,
+        p_raw: tx,
+      });
+      if (error) throwSupabaseError("record_shopee_wallet_transaction", error);
+
+      processed += 1;
+
+      const normalizedStatus = status.toUpperCase();
+      const normalizedFlow = moneyFlow.toUpperCase();
+      const normalizedType = transactionType.toUpperCase();
+      const normalizedTab = tabType.toLowerCase();
+      const amountDecimal = new Decimal(amount);
+
+      if (normalizedStatus === "COMPLETED") completed += 1;
+      if (recorded === true) appliedToCash += 1;
+
+      const isOrderIncome =
+        normalizedStatus === "COMPLETED" &&
+        normalizedFlow === "MONEY_IN" &&
+        amountDecimal.greaterThan(0) &&
+        (
+          normalizedTab === "wallet_order_income" ||
+          normalizedType === "101" ||
+          normalizedType === "ESCROW_VERIFIED_ADD"
+        );
+
+      if (isOrderIncome) {
+        orderIncomeCount += 1;
+        orderIncomeTotal = orderIncomeTotal.plus(amountDecimal.abs());
+      }
+
+      if (currentBalance !== null && createTime >= latestBalanceCreateTime) {
+        latestBalanceCreateTime = createTime;
+        latestBalance = currentBalance;
+      }
+
+      const isZeroWithdrawalLifecycle =
+        amountDecimal.isZero() &&
+        (
+          normalizedType === "202" ||
+          normalizedType === "203" ||
+          normalizedType === "WITHDRAWAL_COMPLETED" ||
+          normalizedType === "WITHDRAW_COMPLETED" ||
+          normalizedType === "WITHDRAWAL_CANCELLED" ||
+          normalizedType === "WITHDRAWAL_CANCELED" ||
+          normalizedType === "WITHDRAW_CANCELLED" ||
+          normalizedType === "WITHDRAW_CANCELED"
+        );
+
+      // MONEY_IN/MONEY_OUT concluído deve gerar caixa. A única exceção legítima é
+      // o evento 202/203 com amount=0: ele é um evento de ciclo do saque e pode ser
+      // resolvido pelo 201 correspondente; nunca deve interromper a leitura do mês.
+      if (
+        normalizedStatus === "COMPLETED" &&
+        (normalizedFlow === "MONEY_IN" || normalizedFlow === "MONEY_OUT") &&
+        recorded !== true &&
+        !isZeroWithdrawalLifecycle
+      ) {
+        throw new Error(
+          `Transação concluída da Carteira Shopee não virou caixa: type=${transactionType}, money_flow=${moneyFlow}, amount=${amount}, order_sn=${orderSn || "sem pedido"}`,
+        );
       }
     }
 
     cursorFrom = cursorTo + 1;
   }
 
-  return { processed, completed, appliedToCash };
+  return {
+    processed,
+    completed,
+    appliedToCash,
+    orderIncomeCount,
+    orderIncomeTotal: orderIncomeTotal.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2),
+    latestBalance,
+  };
 }
 
 async function saveFees(formData: FormData) {
@@ -778,7 +877,7 @@ async function syncRecentShopee() {
     revalidatePath("/contas-pagar");
     revalidatePath("/resumo");
     revalidatePath("/configuracoes");
-    message = `Shopee sincronizada: ${orders.imported} pedido(s), ${reconciled} liquidação(ões), ${wallet.processed} transação(ões) de carteira lida(s), ${wallet.completed} concluída(s) e ${wallet.appliedToCash} aplicada(s) ao caixa.`;
+    message = `Shopee sincronizada: ${wallet.processed} transação(ões) da carteira lida(s); ${wallet.orderIncomeCount} entrada(s) de pedidos somando R$ ${wallet.orderIncomeTotal.replace(".", ",")}; saldo mais recente R$ ${(wallet.latestBalance ?? "0.00").replace(".", ",")}. Pedidos importados: ${orders.imported}; liquidações conciliadas: ${reconciled}.`;
   } catch (error) {
     console.error("ERRO SYNC SHOPEE:", error);
     errorMessage = describeError(error, "Falha desconhecida ao sincronizar a Shopee.");
@@ -827,7 +926,7 @@ async function syncShopeeMonth(formData: FormData) {
     revalidatePath("/contas-pagar");
     revalidatePath("/resumo");
     revalidatePath("/configuracoes");
-    message = `Mês ${month}: ${orders.imported} pedido(s), ${reconciled} liquidação(ões), ${wallet.processed} transação(ões) de carteira lida(s), ${wallet.completed} concluída(s) e ${wallet.appliedToCash} aplicada(s) ao caixa.`;
+    message = `Mês ${month}: ${wallet.processed} transação(ões) da carteira lida(s); ${wallet.orderIncomeCount} entrada(s) de pedidos somando R$ ${wallet.orderIncomeTotal.replace(".", ",")}; saldo mais recente R$ ${(wallet.latestBalance ?? "0.00").replace(".", ",")}. Pedidos importados: ${orders.imported}; liquidações conciliadas: ${reconciled}.`;
   } catch (error) {
     console.error("ERRO IMPORTAÇÃO SHOPEE:", error);
     errorMessage = describeError(error, "Falha desconhecida ao importar o mês da Shopee.");
