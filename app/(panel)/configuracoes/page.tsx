@@ -542,7 +542,7 @@ async function syncWalletRange(userId: string, config: ShopeeConfig, from: numbe
 
   while (cursorFrom <= to) {
     const cursorTo = Math.min(to, cursorFrom + WINDOW_SECONDS - 1);
-    let pageNo = 0;
+    let pageNo = 1;
     for (let page = 0; page < MAX_LIST_PAGES_PER_WINDOW; page += 1) {
       const body = await shopeePost(config, SHOPEE_WALLET_TX_PATH, {
         page_no: pageNo,
@@ -604,7 +604,7 @@ async function syncWalletRange(userId: string, config: ShopeeConfig, from: numbe
       }
 
       if (response.more !== true) break;
-      pageNo += transactions.length || 100;
+      pageNo += 1;
       if (page === MAX_LIST_PAGES_PER_WINDOW - 1) throw new Error("Limite de paginação da carteira Shopee atingido");
     }
     cursorFrom = cursorTo + 1;
