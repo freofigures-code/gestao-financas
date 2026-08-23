@@ -7,9 +7,11 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PendingSubmitButton } from "@/components/pending-submit-button";
+import { PluggyConnectButton } from "@/components/pluggy-connect-button";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { decryptSecret, encryptSecret, hashSecret } from "@/lib/crypto";
+import { pullPluggyData, readPluggySettings, revokePluggyItemAndClear, validatePluggyCredentials } from "@/lib/pluggy";
 
 const SHOPEE_HOST = "https://partner.shopeemobile.com";
 const SHOPEE_AUTH_PATH = "/api/v2/shop/auth_partner";
@@ -799,6 +801,106 @@ async function saveFees(formData: FormData) {
   redirect(qs("Taxas e custos salvos; vendas recalculadas."));
 }
 
+
+async function savePluggyIntegration(formData: FormData) {
+  "use server";
+  const { supabase, user } = await requireUser();
+  const current = await readPluggySettings(user.id);
+  const clientIdInput = text(formData, "pluggy_client_id");
+  const clientSecretInput = text(formData, "pluggy_client_secret");
+  const personalReceiverName = text(formData, "pluggy_personal_receiver_name") || "KEVYN APARECIDO FREO";
+
+  const currentClientId = current.credentials?.clientId ?? "";
+  const currentClientSecret = current.credentials?.clientSecret ?? "";
+  const nextClientId = clientIdInput || currentClientId;
+  const nextClientSecret = clientSecretInput || currentClientSecret;
+
+  if (!nextClientId || !nextClientSecret) {
+    redirect(qs("Informe o Client ID e o Client Secret da aplicação Pluggy.", "error"));
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(nextClientId)) {
+    redirect(qs("Client ID Pluggy inválido. Use o UUID exibido no Dashboard Pluggy.", "error"));
+  }
+  if (clientIdInput && currentClientId && clientIdInput !== currentClientId && !clientSecretInput) {
+    redirect(qs("Ao trocar o Client ID, informe também o Client Secret correspondente.", "error"));
+  }
+
+  let validationError = "";
+  try {
+    await validatePluggyCredentials(nextClientId, nextClientSecret);
+  } catch (error) {
+    validationError = describeError(error, "Falha ao validar as credenciais Pluggy.");
+  }
+  if (validationError) redirect(qs(validationError, "error"));
+
+  const { error } = await supabase
+    .from("integration_settings")
+    .update({
+      pluggy_credentials_ciphertext: encryptSecret(JSON.stringify({ clientId: nextClientId, clientSecret: nextClientSecret })),
+      pluggy_personal_receiver_name: personalReceiverName,
+    })
+    .eq("user_id", user.id);
+  if (error) redirect(qs(error.message, "error"));
+  revalidatePath("/configuracoes");
+  redirect(qs("Credenciais Pluggy validadas e salvas."));
+}
+
+async function selectPluggyAccount(formData: FormData) {
+  "use server";
+  const { supabase, user } = await requireUser();
+  const accountId = text(formData, "pluggy_account_id");
+  if (!accountId) redirect(qs("Selecione a conta bancária.", "error"));
+
+  const { data: account, error: accountError } = await supabase
+    .from("pluggy_bank_accounts")
+    .select("pluggy_account_id")
+    .eq("user_id", user.id)
+    .eq("pluggy_account_id", accountId)
+    .single();
+  if (accountError || !account) redirect(qs(accountError?.message || "Conta Pluggy não encontrada.", "error"));
+
+  const { error } = await supabase
+    .from("integration_settings")
+    .update({ pluggy_account_id: accountId })
+    .eq("user_id", user.id);
+  if (error) redirect(qs(error.message, "error"));
+  revalidatePath("/configuracoes");
+  revalidatePath("/fluxo-caixa");
+  redirect(qs("Conta Nubank PJ selecionada."));
+}
+
+async function pullPluggy() {
+  "use server";
+  const { user } = await requireUser();
+  let message = "";
+  let errorMessage = "";
+  try {
+    const result = await pullPluggyData(user.id);
+    message = result.needsAccountSelection
+      ? `Pluggy sincronizada: ${result.transactions} transação(ões). Selecione abaixo qual conta é a Nubank PJ.`
+      : `Nubank PJ sincronizado: ${result.transactions} transação(ões) e ${result.accounts} conta(s) atualizadas.`;
+  } catch (error) {
+    errorMessage = describeError(error, "Falha ao sincronizar a Pluggy.");
+  }
+  revalidatePath("/configuracoes");
+  revalidatePath("/fluxo-caixa");
+  redirect(errorMessage ? qs(errorMessage, "error") : qs(message));
+}
+
+async function disconnectPluggy() {
+  "use server";
+  const { user } = await requireUser();
+  let errorMessage = "";
+  try {
+    await revokePluggyItemAndClear(user.id);
+  } catch (error) {
+    errorMessage = describeError(error, "Falha ao remover a integração Pluggy.");
+  }
+  revalidatePath("/configuracoes");
+  revalidatePath("/fluxo-caixa");
+  redirect(errorMessage ? qs(errorMessage, "error") : qs("Integração Nubank PJ removida do painel."));
+}
+
 async function saveAiIntegration(formData: FormData) {
   "use server";
   const { supabase, user } = await requireUser();
@@ -1044,23 +1146,30 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
     redirect(callbackError ? qs(callbackError, "error") : qs("Shopee conectada com sucesso."));
   }
 
-  const [feesResult, integrationResult, categoriesResult, columnsResult, shopee] = await Promise.all([
+  const [feesResult, integrationResult, categoriesResult, columnsResult, shopee, pluggy, pluggyAccountsResult] = await Promise.all([
     supabase.from("fee_settings").select("*").single(),
     supabase.from("integration_settings").select("ai_enabled,ai_provider,ai_model,ai_webhook_url").single(),
     supabase.from("categories").select("*").order("type").order("name"),
     supabase.from("custom_columns").select("*").order("table_name").order("position"),
     readShopeeConfig(user.id),
+    readPluggySettings(user.id),
+    supabase.from("pluggy_bank_accounts").select("pluggy_account_id,name,marketing_name,number_masked,balance,currency_code,synced_at").eq("user_id", user.id).order("name"),
   ]);
 
   if (feesResult.error) throw feesResult.error;
   if (integrationResult.error) throw integrationResult.error;
   if (categoriesResult.error) throw categoriesResult.error;
   if (columnsResult.error) throw columnsResult.error;
+  if (pluggyAccountsResult.error) throw pluggyAccountsResult.error;
 
   const fees = feesResult.data;
   const integration = integrationResult.data;
   const categories = categoriesResult.data ?? [];
   const columns = columnsResult.data ?? [];
+  const pluggyAccounts = pluggyAccountsResult.data ?? [];
+  const pluggyConfigured = Boolean(pluggy.credentials);
+  const pluggyConnected = Boolean(pluggy.pluggy_item_id);
+  const selectedPluggyAccount = pluggyAccounts.find((account: any) => account.pluggy_account_id === pluggy.pluggy_account_id) ?? null;
   const cookieStore = await cookies();
   const n8nSecret = cookieStore.get("freo_n8n_secret_once")?.value;
   const connected = Boolean(shopee?.shopId && shopee?.refreshToken);
@@ -1147,6 +1256,68 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
               <div className="md:col-span-2"><PendingSubmitButton pendingText="Conectando...">Conectar Shopee</PendingSubmitButton></div>
             </form>
           )}
+        </CardContent>
+      </Card>
+
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Nubank PJ via Meu Pluggy (uso próprio)</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Integração gratuita para uso próprio. Primeiro conecte a conta Nubank PJ em <a className="underline" href="https://meu.pluggy.ai" target="_blank" rel="noreferrer">meu.pluggy.ai</a>. Depois crie uma aplicação no <a className="underline" href="https://dashboard.pluggy.ai" target="_blank" rel="noreferrer">Dashboard Pluggy</a>, copie o Client ID/Secret e salve abaixo. O botão deste painel executa o vínculo da conta que já está no Meu Pluggy com essa aplicação; ele não substitui a autorização inicial do Nubank no Meu Pluggy.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <form action={savePluggyIntegration} className="grid gap-3 md:grid-cols-2">
+            <div>
+              <Label htmlFor="pluggy_client_id">Pluggy Client ID</Label>
+              <Input id="pluggy_client_id" name="pluggy_client_id" defaultValue={pluggy.credentials?.clientId ?? ""} placeholder="UUID da aplicação Pluggy" required={!pluggyConfigured} />
+            </div>
+            <div>
+              <Label htmlFor="pluggy_client_secret">Pluggy Client Secret</Label>
+              <Input id="pluggy_client_secret" name="pluggy_client_secret" type="password" placeholder={pluggyConfigured ? "Deixe vazio para manter o atual" : "Client Secret da aplicação"} required={!pluggyConfigured} />
+            </div>
+            <div className="md:col-span-2">
+              <Label htmlFor="pluggy_personal_receiver_name">Nome que identifica retirada para uso pessoal</Label>
+              <Input id="pluggy_personal_receiver_name" name="pluggy_personal_receiver_name" defaultValue={pluggy.pluggy_personal_receiver_name || "KEVYN APARECIDO FREO"} required />
+              <p className="mt-1 text-xs text-muted-foreground">Pix de saída cujo destinatário corresponda a este nome será classificado como retirada pessoal. Os demais débitos serão classificados como gasto da Freo Figures e podem ser corrigidos manualmente no Fluxo de Caixa.</p>
+            </div>
+            <div className="md:col-span-2"><PendingSubmitButton pendingText="Validando Pluggy...">Salvar e validar credenciais Pluggy</PendingSubmitButton></div>
+          </form>
+
+          <div className="border-t pt-4">
+            <div className="mb-3 grid gap-3 rounded-lg border p-4 md:grid-cols-4">
+              <div><div className="text-xs text-muted-foreground">Credenciais</div><div className={pluggyConfigured ? "font-semibold text-emerald-600" : "font-semibold"}>{pluggyConfigured ? "● Válidas/salvas" : "Não configuradas"}</div></div>
+              <div><div className="text-xs text-muted-foreground">Vínculo Meu Pluggy</div><div className={pluggyConnected ? "font-semibold text-emerald-600" : "font-semibold"}>{pluggyConnected ? "● Vinculado" : "Não vinculado"}</div></div>
+              <div><div className="text-xs text-muted-foreground">Conta usada</div><div className="text-sm">{selectedPluggyAccount ? `${selectedPluggyAccount.marketing_name || selectedPluggyAccount.name}${selectedPluggyAccount.number_masked ? ` · ${selectedPluggyAccount.number_masked}` : ""}` : "Ainda não selecionada"}</div></div>
+              <div><div className="text-xs text-muted-foreground">Última cópia para o painel</div><div className="text-sm">{pluggy.pluggy_last_sync_at ? new Date(pluggy.pluggy_last_sync_at).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" }) : "Ainda não executada"}</div></div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <PluggyConnectButton configured={pluggyConfigured} itemId={pluggy.pluggy_item_id} />
+              {pluggyConnected ? <form action={pullPluggy}><PendingSubmitButton pendingText="Sincronizando Nubank..." variant="outline">Atualizar dados salvos da Pluggy</PendingSubmitButton></form> : null}
+              {pluggyConnected ? <form action={disconnectPluggy}><PendingSubmitButton pendingText="Removendo integração..." variant="outline">Remover integração Nubank</PendingSubmitButton></form> : null}
+            </div>
+          </div>
+
+          {pluggyConnected && pluggyAccounts.length > 1 ? (
+            <form action={selectPluggyAccount} className="grid gap-3 rounded-lg border p-4 md:grid-cols-[1fr_auto] md:items-end">
+              <div>
+                <Label htmlFor="pluggy_account_id">Qual conta deve representar o Nubank PJ no Fluxo de Caixa?</Label>
+                <select id="pluggy_account_id" name="pluggy_account_id" className="h-10 w-full rounded-md border bg-background px-3" defaultValue={pluggy.pluggy_account_id ?? ""} required>
+                  <option value="" disabled>Selecione a conta</option>
+                  {pluggyAccounts.map((account: any) => <option key={account.pluggy_account_id} value={account.pluggy_account_id}>{account.marketing_name || account.name}{account.number_masked ? ` · ${account.number_masked}` : ""}</option>)}
+                </select>
+              </div>
+              <PendingSubmitButton pendingText="Salvando conta..." variant="outline">Usar esta conta</PendingSubmitButton>
+            </form>
+          ) : null}
+
+          {selectedPluggyAccount ? (
+            <div className="rounded-lg bg-muted p-3 text-sm">
+              <b>Saldo sincronizado da conta:</b> {new Intl.NumberFormat("pt-BR", { style: "currency", currency: selectedPluggyAccount.currency_code || "BRL" }).format(Number(selectedPluggyAccount.balance ?? 0))}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
