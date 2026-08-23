@@ -14,6 +14,7 @@ import { Table, THead, TBody, TR, TH, TD } from "@/components/ui/table";
 import { createClient } from "@/lib/supabase/client";
 import { formatBRL } from "@/lib/money";
 import { toast } from "sonner";
+import { nextMonthStart } from "@/lib/date";
 
 type BankAccount = {
   id: string;
@@ -162,34 +163,62 @@ export default function Fluxo() {
       setPositionLoading(true);
       const supabase = createClient();
 
-      const [accountsResult, balanceResult] = await Promise.all([
-        supabase
-          .from("cash_accounts")
-          .select("id,name,kind,opening_balance")
-          .in("kind", ["bank", "other"])
-          .order("created_at"),
-        supabase.rpc("get_bank_cash_balance", { p_month: `${month}-01` }),
-      ]);
+      const accountsResult = await supabase
+        .from("cash_accounts")
+        .select("id,name,kind,opening_balance")
+        .in("kind", ["bank", "other"])
+        .eq("active", true)
+        .order("created_at");
 
       if (cancelled) return;
 
       if (accountsResult.error) {
         toast.error(accountsResult.error.message);
-      } else {
-        const rows = (accountsResult.data ?? []) as BankAccount[];
-        setBankAccounts(rows);
-        setSelectedBankAccountId((current) => {
-          if (current && rows.some((row) => row.id === current)) return current;
-          return rows[0]?.id ?? "";
-        });
+        setBankAccounts([]);
+        setBankCashBalance("0.00");
+        setPositionLoading(false);
+        return;
       }
 
-      if (balanceResult.error) {
-        toast.error(balanceResult.error.message);
-      } else {
-        setBankCashBalance(String(balanceResult.data ?? "0"));
+      const rows = (accountsResult.data ?? []) as BankAccount[];
+      setBankAccounts(rows);
+      setSelectedBankAccountId((current) => {
+        if (current && rows.some((row) => row.id === current)) return current;
+        return rows[0]?.id ?? "";
+      });
+
+      const openingTotal = rows.reduce(
+        (sum, account) => sum.plus(String(account.opening_balance ?? 0)),
+        new Decimal(0),
+      );
+
+      if (rows.length === 0) {
+        setBankCashBalance(openingTotal.toFixed(2));
+        setPositionLoading(false);
+        return;
       }
 
+      const movementResult = await supabase
+        .from("cash_movements")
+        .select("account_id,direction,amount")
+        .in("account_id", rows.map((account) => account.id))
+        .lt("occurred_at", nextMonthStart(month));
+
+      if (cancelled) return;
+
+      if (movementResult.error) {
+        toast.error(movementResult.error.message);
+        setBankCashBalance(openingTotal.toFixed(2));
+        setPositionLoading(false);
+        return;
+      }
+
+      const movementTotal = (movementResult.data ?? []).reduce((sum: Decimal, movement: any) => {
+        const amount = new Decimal(String(movement.amount ?? 0));
+        return movement.direction === "in" ? sum.plus(amount) : sum.minus(amount);
+      }, new Decimal(0));
+
+      setBankCashBalance(openingTotal.plus(movementTotal).toDecimalPlaces(2).toFixed(2));
       setPositionLoading(false);
     }
 
