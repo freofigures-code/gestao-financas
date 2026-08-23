@@ -6,7 +6,7 @@ import { revalidatePath } from "next/cache";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Button } from "@/components/ui/button";
+import { PendingSubmitButton } from "@/components/pending-submit-button";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { decryptSecret, encryptSecret, hashSecret } from "@/lib/crypto";
@@ -1005,7 +1005,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
             <div><Label htmlFor="default_packaging_cost">Embalagem padrão / un. (R$)</Label><Input id="default_packaging_cost" name="default_packaging_cost" inputMode="decimal" min="0" step="0.0001" defaultValue={fees.default_packaging_cost ?? "0.0000"} required /></div>
             <div className="md:col-span-3 xl:col-span-6">
               <p className="mb-3 text-xs text-muted-foreground">Shopee: a comissão percentual é calculada por unidade e a taxa fixa é multiplicada pela quantidade vendida; o frete não entra na base configurada. Produção: filamento por gramas e energia = horas × W ÷ 1000 × R$/kWh.</p>
-              <Button type="submit">Salvar e recalcular vendas</Button>
+              <PendingSubmitButton pendingText="Salvando e recalculando...">Salvar e recalcular vendas</PendingSubmitButton>
             </div>
           </form>
         </CardContent>
@@ -1023,8 +1023,8 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <form action={syncRecentShopee}><Button type="submit">Sincronizar pedidos + financeiro</Button></form>
-                <form action={disconnectShopee}><Button type="submit" variant="outline">Remover conexão</Button></form>
+                <form action={syncRecentShopee}><PendingSubmitButton pendingText="Sincronizando Shopee...">Sincronizar pedidos + financeiro</PendingSubmitButton></form>
+                <form action={disconnectShopee}><PendingSubmitButton pendingText="Removendo..." variant="outline">Remover conexão</PendingSubmitButton></form>
               </div>
 
               <form action={syncShopeeMonth} className="grid gap-3 rounded-lg border p-4 md:grid-cols-[240px_auto] md:items-end">
@@ -1032,7 +1032,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
                   <Label htmlFor="month">Importar/reimportar um mês</Label>
                   <Input id="month" name="month" type="month" max={currentMonth} defaultValue={currentMonth} required />
                 </div>
-                <div><Button type="submit" variant="outline">Importar mês + financeiro</Button></div>
+                <div><PendingSubmitButton pendingText="Importando mês..." variant="outline">Importar mês + financeiro</PendingSubmitButton></div>
               </form>
             </>
           ) : (
@@ -1045,7 +1045,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
                 <Label htmlFor="partner_key">Partner Key</Label>
                 <Input id="partner_key" name="partner_key" type="password" placeholder="Cole a Partner Key da Shopee Open Platform" required />
               </div>
-              <div className="md:col-span-2"><Button type="submit">Conectar Shopee</Button></div>
+              <div className="md:col-span-2"><PendingSubmitButton pendingText="Conectando...">Conectar Shopee</PendingSubmitButton></div>
             </form>
           )}
         </CardContent>
@@ -1070,12 +1070,12 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
             </div>
             <div><Label htmlFor="ai_model">Modelo (API direta)</Label><Input id="ai_model" name="ai_model" defaultValue={integration.ai_model ?? ""} placeholder="Informe um modelo disponível na sua conta" /></div>
             <div><Label htmlFor="ai_api_key">API Key IA</Label><Input id="ai_api_key" name="ai_api_key" type="password" placeholder="Deixe vazio para manter a chave atual" /></div>
-            <div className="md:col-span-2"><Button type="submit">Salvar integração de IA</Button></div>
+            <div className="md:col-span-2"><PendingSubmitButton pendingText="Salvando...">Salvar integração de IA</PendingSubmitButton></div>
           </form>
 
           <div className="grid gap-3 border-t pt-4 md:grid-cols-2">
             <div><Label>Endpoint de recebimento n8n</Label><div className="flex h-10 items-center rounded-md border bg-muted px-3 font-mono text-xs">/api/integrations/n8n/sales</div></div>
-            <div className="flex items-end"><form action={generateN8nSecret}><Button type="submit" variant="outline">Gerar segredo do n8n</Button></form></div>
+            <div className="flex items-end"><form action={generateN8nSecret}><PendingSubmitButton pendingText="Gerando..." variant="outline">Gerar segredo do n8n</PendingSubmitButton></form></div>
             {n8nSecret ? (
               <div className="md:col-span-2 rounded-lg bg-muted p-3 text-sm">
                 <b>Copie agora; este segredo expira da tela em 2 minutos:</b>
@@ -1093,7 +1093,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
           <form action={addCategory} className="mb-3 flex flex-col gap-2 md:flex-row">
             <Input name="name" placeholder="Nova categoria" required />
             <select name="type" className="h-10 rounded-md border bg-background px-3" defaultValue="expense"><option value="expense">Saída</option><option value="income">Entrada</option></select>
-            <Button type="submit">Adicionar</Button>
+            <PendingSubmitButton pendingText="Adicionando...">Adicionar</PendingSubmitButton>
           </form>
           <div className="flex flex-wrap gap-2 text-sm text-muted-foreground">
             {categories.map((category) => (
@@ -1116,7 +1116,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
             <Input name="label" placeholder="Rótulo" required />
             <select name="data_type" className="h-10 rounded-md border bg-background px-3" defaultValue="text"><option value="text">Texto</option><option value="number">Número</option><option value="date">Data</option><option value="boolean">Sim/Não</option></select>
             <Input name="key" placeholder="chave_opcional" />
-            <Button type="submit">Adicionar coluna</Button>
+            <PendingSubmitButton pendingText="Adicionando...">Adicionar coluna</PendingSubmitButton>
           </form>
           <div className="mt-3 text-sm text-muted-foreground">
             {columns.length ? columns.map((column) => (
