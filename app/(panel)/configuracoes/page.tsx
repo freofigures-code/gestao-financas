@@ -80,6 +80,35 @@ function text(formData: FormData, name: string) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+type ErrorLike = {
+  message?: unknown;
+  details?: unknown;
+  hint?: unknown;
+  code?: unknown;
+};
+
+function describeError(error: unknown, fallback = "Erro desconhecido") {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  if (typeof error === "string" && error.trim()) return error.trim();
+
+  if (error && typeof error === "object") {
+    const value = error as ErrorLike;
+    const parts = [
+      typeof value.message === "string" && value.message.trim() ? value.message.trim() : "",
+      typeof value.details === "string" && value.details.trim() ? `details: ${value.details.trim()}` : "",
+      typeof value.hint === "string" && value.hint.trim() ? `hint: ${value.hint.trim()}` : "",
+      typeof value.code === "string" && value.code.trim() ? `code: ${value.code.trim()}` : "",
+    ].filter(Boolean);
+    if (parts.length) return parts.join(" | ");
+  }
+
+  return fallback;
+}
+
+function throwSupabaseError(context: string, error: unknown): never {
+  throw new Error(`[${context}] ${describeError(error, "Erro desconhecido retornado pelo Supabase")}`);
+}
+
 function qs(message: string, kind: "ok" | "error" = "ok") {
   const params = new URLSearchParams({ [kind]: message });
   return `/configuracoes?${params.toString()}`;
@@ -144,7 +173,7 @@ async function readShopeeConfig(userId: string): Promise<ShopeeConfig | null> {
     .select("shopee_api_key_ciphertext")
     .eq("user_id", userId)
     .single();
-  if (error) throw error;
+  if (error) throwSupabaseError("readShopeeConfig", error);
   return parseShopeeConfig(data?.shopee_api_key_ciphertext);
 }
 
@@ -154,7 +183,7 @@ async function writeShopeeConfig(userId: string, config: ShopeeConfig | null) {
     .from("integration_settings")
     .update({ shopee_api_key_ciphertext: config ? encryptSecret(JSON.stringify(config)) : null })
     .eq("user_id", userId);
-  if (error) throw error;
+  if (error) throwSupabaseError("writeShopeeConfig", error);
 }
 
 async function shopeeJson(url: string, init?: RequestInit) {
@@ -454,7 +483,7 @@ async function ingestOrderSns(userId: string, config: ShopeeConfig, orderSns: st
     const sales = orders.map(toIngestSale);
     if (sales.length === 0) continue;
     const { data, error } = await admin.rpc("ingest_sales_batch", { p_user_id: userId, p_sales: sales, p_source: "integration" });
-    if (error) throw error;
+    if (error) throwSupabaseError("ingest_sales_batch", error);
     imported += Number(data ?? sales.length);
   }
 
@@ -528,7 +557,7 @@ async function reconcileCompletedEscrow(userId: string, config: ShopeeConfig, or
         p_transaction: transactionFee,
         p_reconciled_at: new Date().toISOString(),
       });
-      if (error) throw error;
+      if (error) throwSupabaseError("apply_shopee_escrow", error);
       reconciled += 1;
     }
   }
@@ -538,11 +567,14 @@ async function reconcileCompletedEscrow(userId: string, config: ShopeeConfig, or
 async function syncWalletRange(userId: string, config: ShopeeConfig, from: number, to: number) {
   const admin = createAdminClient();
   let processed = 0;
+  let completed = 0;
+  let appliedToCash = 0;
   let cursorFrom = from;
 
   while (cursorFrom <= to) {
     const cursorTo = Math.min(to, cursorFrom + WINDOW_SECONDS - 1);
     let pageNo = 1;
+
     for (let page = 0; page < MAX_LIST_PAGES_PER_WINDOW; page += 1) {
       const body = await shopeePost(config, SHOPEE_WALLET_TX_PATH, {
         page_no: pageNo,
@@ -550,18 +582,25 @@ async function syncWalletRange(userId: string, config: ShopeeConfig, from: numbe
         create_time_from: cursorFrom,
         create_time_to: cursorTo,
       });
-      const response = body.response && typeof body.response === "object" ? body.response as Record<string, unknown> : null;
+      const response = body.response && typeof body.response === "object"
+        ? body.response as Record<string, unknown>
+        : null;
       if (!response) throw new Error("Resposta de get_wallet_transaction_list sem response");
+
       const transactions = Array.isArray(response.transaction_list) ? response.transaction_list : [];
 
       for (const raw of transactions) {
         if (!raw || typeof raw !== "object") continue;
         const tx = raw as Record<string, unknown>;
         const createTime = Number(tx.create_time);
-        if (!Number.isFinite(createTime) || createTime <= 0) throw new Error("Transação Shopee sem create_time válido");
+        if (!Number.isFinite(createTime) || createTime <= 0) {
+          throw new Error("Transação Shopee sem create_time válido");
+        }
+
         const transactionType = String(tx.transaction_type ?? "").trim();
         const status = String(tx.status ?? "").trim();
         if (!transactionType || !status) throw new Error("Transação Shopee sem status/tipo");
+
         const withdrawalId = tx.withdrawal_id == null ? "" : String(tx.withdrawal_id);
         const rootWithdrawalId = tx.root_withdrawal_id == null ? "" : String(tx.root_withdrawal_id);
         const orderSn = String(tx.order_sn ?? "").trim();
@@ -572,14 +611,25 @@ async function syncWalletRange(userId: string, config: ShopeeConfig, from: numbe
         const moneyFlow = String(tx.money_flow ?? "").trim();
         const tabType = String(tx.transaction_tab_type ?? "").trim();
         const description = String(tx.txn_title ?? tx.description ?? tx.reason ?? "Movimento Carteira Shopee").trim();
-        // Chave estável do evento: status e saldo corrente podem mudar entre leituras;
-        // não podem criar uma segunda transação financeira para o mesmo evento.
+
+        // O status e o saldo podem mudar entre leituras. Eles não entram na chave,
+        // impedindo que a mesma transação vire um segundo movimento de caixa.
         const externalKey = crypto.createHash("sha256").update([
-          config.shopId, createTime, transactionType, withdrawalId, rootWithdrawalId, orderSn, refundSn,
-          amount, transactionFee, moneyFlow, tabType, description,
+          config.shopId,
+          createTime,
+          transactionType,
+          withdrawalId,
+          rootWithdrawalId,
+          orderSn,
+          refundSn,
+          amount,
+          transactionFee,
+          moneyFlow,
+          tabType,
+          description,
         ].join("|")).digest("hex");
 
-        const { error } = await admin.rpc("record_shopee_wallet_transaction", {
+        const { data: recorded, error } = await admin.rpc("record_shopee_wallet_transaction", {
           p_user_id: userId,
           p_shop_id: config.shopId!,
           p_external_key: externalKey,
@@ -599,17 +649,38 @@ async function syncWalletRange(userId: string, config: ShopeeConfig, from: numbe
           p_description: description,
           p_raw: tx,
         });
-        if (error) throw error;
+        if (error) throwSupabaseError("record_shopee_wallet_transaction", error);
+
         processed += 1;
+        const normalizedStatus = status.toUpperCase();
+        const normalizedFlow = moneyFlow.toUpperCase();
+        if (normalizedStatus === "COMPLETED") completed += 1;
+        if (recorded === true) appliedToCash += 1;
+
+        // Uma transação concluída que a própria Shopee marcou como entrada/saída deve
+        // virar movimento. Se o RPC a ignorar, paramos aqui e mostramos os dados exatos.
+        if (
+          normalizedStatus === "COMPLETED" &&
+          (normalizedFlow === "MONEY_IN" || normalizedFlow === "MONEY_OUT") &&
+          recorded !== true
+        ) {
+          throw new Error(
+            `Transação concluída da Carteira Shopee não virou caixa: type=${transactionType}, money_flow=${moneyFlow}, amount=${amount}, order_sn=${orderSn || "sem pedido"}`,
+          );
+        }
       }
 
       if (response.more !== true) break;
       pageNo += 1;
-      if (page === MAX_LIST_PAGES_PER_WINDOW - 1) throw new Error("Limite de paginação da carteira Shopee atingido");
+      if (page === MAX_LIST_PAGES_PER_WINDOW - 1) {
+        throw new Error("Limite de paginação da carteira Shopee atingido");
+      }
     }
+
     cursorFrom = cursorTo + 1;
   }
-  return processed;
+
+  return { processed, completed, appliedToCash };
 }
 
 async function saveFees(formData: FormData) {
@@ -689,11 +760,12 @@ async function syncRecentShopee() {
     const nowMap = Object.fromEntries(nowParts.map((part) => [part.type, part.value]));
     const firstDayThisMonth = saoPauloMidnightUnix(Number(nowMap.year), Number(nowMap.month), 1);
     const ordersFrom = config.lastSyncAt ? Math.max(0, Math.floor(config.lastSyncAt / 1000) - 3600) : firstDayThisMonth;
-    // O financeiro tem cursor próprio. Assim, quem já sincronizava pedidos antes da migration
-    // recebe automaticamente o histórico financeiro do mês atual na primeira sincronização.
-    const walletFrom = config.lastWalletSyncAt
-      ? Math.max(0, Math.floor(config.lastWalletSyncAt / 1000) - 3600)
-      : firstDayThisMonth;
+
+    // A sincronização manual refaz a carteira desde o primeiro dia do mês atual.
+    // O RPC do banco é idempotente, então isto também repara movimentos financeiros
+    // que tenham sido perdidos por uma execução anterior sem duplicar o caixa.
+    const walletFrom = firstDayThisMonth;
+
     const orders = await syncRange(user.id, config, ordersFrom, now, "update_time");
     const reconciled = await reconcileCompletedEscrow(user.id, config, orders.completedOrderSns);
     const wallet = await syncWalletRange(user.id, config, walletFrom, now);
@@ -706,9 +778,10 @@ async function syncRecentShopee() {
     revalidatePath("/contas-pagar");
     revalidatePath("/resumo");
     revalidatePath("/configuracoes");
-    message = `Shopee sincronizada: ${orders.imported} pedido(s), ${reconciled} liquidação(ões) conciliada(s) e ${wallet} movimento(s) de carteira processado(s).`;
+    message = `Shopee sincronizada: ${orders.imported} pedido(s), ${reconciled} liquidação(ões), ${wallet.processed} transação(ões) de carteira lida(s), ${wallet.completed} concluída(s) e ${wallet.appliedToCash} aplicada(s) ao caixa.`;
   } catch (error) {
-    errorMessage = error instanceof Error ? error.message : "Falha ao sincronizar a Shopee.";
+    console.error("ERRO SYNC SHOPEE:", error);
+    errorMessage = describeError(error, "Falha desconhecida ao sincronizar a Shopee.");
   }
   redirect(errorMessage ? qs(errorMessage, "error") : qs(message));
 }
@@ -754,9 +827,10 @@ async function syncShopeeMonth(formData: FormData) {
     revalidatePath("/contas-pagar");
     revalidatePath("/resumo");
     revalidatePath("/configuracoes");
-    message = `Mês ${month}: ${orders.imported} pedido(s), ${reconciled} liquidação(ões) conciliada(s) e ${wallet} movimento(s) de carteira processado(s).`;
+    message = `Mês ${month}: ${orders.imported} pedido(s), ${reconciled} liquidação(ões), ${wallet.processed} transação(ões) de carteira lida(s), ${wallet.completed} concluída(s) e ${wallet.appliedToCash} aplicada(s) ao caixa.`;
   } catch (error) {
-    errorMessage = error instanceof Error ? error.message : "Falha ao importar o mês da Shopee.";
+    console.error("ERRO IMPORTAÇÃO SHOPEE:", error);
+    errorMessage = describeError(error, "Falha desconhecida ao importar o mês da Shopee.");
   }
   redirect(errorMessage ? qs(errorMessage, "error") : qs(message));
 }
@@ -866,7 +940,7 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
       const connected = await exchangeShopeeCode(current, callbackCode, callbackShopId);
       await writeShopeeConfig(user.id, connected);
     } catch (error) {
-      callbackError = error instanceof Error ? error.message : "Falha ao concluir autorização da Shopee.";
+      callbackError = describeError(error, "Falha ao concluir autorização da Shopee.");
     }
     redirect(callbackError ? qs(callbackError, "error") : qs("Shopee conectada com sucesso."));
   }
