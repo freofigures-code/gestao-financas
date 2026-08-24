@@ -291,6 +291,26 @@ function accountTypeOf(account: JsonRecord): "BANK" | "CREDIT" | "" {
   return type === "BANK" || type === "CREDIT" ? type : "";
 }
 
+function transactionTypeOf(transaction: JsonRecord, accountType: "BANK" | "CREDIT"): "DEBIT" | "CREDIT" {
+  const explicit = string(transaction.type).toUpperCase();
+  if (explicit === "DEBIT" || explicit === "CREDIT") return explicit;
+
+  const amount = roundMoney(transaction.amount);
+
+  // A documentação da Pluggy garante a convenção abaixo para cartões:
+  // valor positivo = nova compra/débito; valor negativo = crédito/pagamento.
+  // O campo `type` é documentado como disponível apenas em conectores Open Finance;
+  // por isso o conector MeuPluggy pode entregar uma transação de cartão sem `type`.
+  if (accountType === "CREDIT") {
+    if (amount > 0) return "DEBIT";
+    return "CREDIT";
+  }
+
+  // Para BANK o usuário atual já recebe `type` do Open Finance.
+  // Se algum conector não o enviar, usamos o sinal como fallback conservador.
+  return amount < 0 ? "DEBIT" : "CREDIT";
+}
+
 function transactionIdentity(transaction: JsonRecord, accountType: "BANK" | "CREDIT") {
   const paymentData = object(transaction.paymentData);
   const payer = object(paymentData?.payer);
@@ -322,7 +342,7 @@ function transactionIdentity(transaction: JsonRecord, accountType: "BANK" | "CRE
       matchLabel = canonical || description;
     }
   } else {
-    const type = string(transaction.type).toUpperCase();
+    const type = transactionTypeOf(transaction, accountType);
     if (type === "DEBIT") {
       if (receiverDocument) {
         matchKey = `receiver-doc:${receiverDocument}`;
@@ -373,19 +393,24 @@ export function classifyPluggyTransaction(
   accountType: "BANK" | "CREDIT" = "BANK",
 ): SpendClassification {
   const status = string(transaction.status).toUpperCase();
-  const type = string(transaction.type).toUpperCase();
-  const signedAmount = roundMoney(transaction.amount);
+  const type = transactionTypeOf(transaction, accountType);
 
   if (accountType === "CREDIT") {
-    // Para cartão, `type` é o discriminador semântico: DEBIT = compra/gasto;
-    // CREDIT = crédito/estorno/pagamento. Não usamos o sinal do amount para decidir.
     if (type === "DEBIT") return "review";
-    if (type === "CREDIT") return "credit";
-    return "review";
+    return "credit";
   }
 
   if (type === "CREDIT") return "credit";
   if (type !== "DEBIT" || status !== "POSTED") return "review";
+
+  const normalizedDescription = normalizeName(transaction.description);
+  if (
+    normalizedDescription === "PAGAMENTO DE FATURA" ||
+    normalizedDescription.startsWith("PAGAMENTO DE FATURA ") ||
+    normalizedDescription.includes(" PAGAMENTO DE FATURA ")
+  ) {
+    return "card_payment";
+  }
 
   const paymentData = object(transaction.paymentData);
   const receiver = object(paymentData?.receiver);
@@ -435,6 +460,9 @@ export type PluggyPullResult = {
   bankAccounts: number;
   creditAccounts: number;
   transactions: number;
+  creditCardTransactions: number;
+  creditCardPurchases: number;
+  creditCardWarningCodes: string[];
   selectedAccountId: string | null;
   selectedAccountName: string | null;
   selectedBalance: number | null;
@@ -453,6 +481,15 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
   const item = await pluggyRequest(apiKey, `/items/${encodeURIComponent(itemId)}`);
   const itemStatus = string(item.status);
   const executionStatus = string(item.executionStatus);
+  const statusDetail = object(item.statusDetail);
+  const creditCardsDetail = object(statusDetail?.creditCards);
+  const creditCardWarnings = Array.isArray(creditCardsDetail?.warnings)
+    ? creditCardsDetail.warnings.filter((warning): warning is JsonRecord => Boolean(object(warning)))
+    : [];
+  const creditCardWarningCodes = creditCardWarnings
+    .map((warning) => string(warning.code))
+    .filter(Boolean);
+
   if (itemStatus === "LOGIN_ERROR") {
     throw new Error(`A conexão Pluggy precisa ser autorizada novamente (${executionStatus || "LOGIN_ERROR"}).`);
   }
@@ -535,6 +572,8 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
 
   const personalReceiverName = string(settings.pluggy_personal_receiver_name) || "KEVYN APARECIDO FREO";
   let transactionCount = 0;
+  let creditCardTransactions = 0;
+  let creditCardPurchases = 0;
 
   for (const account of accounts) {
     const accountId = string(account.id);
@@ -559,6 +598,13 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     }
 
     const remoteTransactions = await listAllTransactions(apiKey, accountId);
+    if (accountType === "CREDIT") {
+      creditCardTransactions += remoteTransactions.length;
+      creditCardPurchases += remoteTransactions.filter(
+        (transaction) => transactionTypeOf(transaction, accountType) === "DEBIT",
+      ).length;
+    }
+
     const rows = remoteTransactions.map((transaction) => {
       const transactionId = string(transaction.id);
       const date = string(transaction.date);
@@ -573,8 +619,8 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
       let categoryId: string | null = null;
       let classificationSource: "auto" | "rule" | "manual" = "auto";
 
-      if (automatic === "personal") {
-        classification = "personal";
+      if (automatic === "personal" || automatic === "card_payment") {
+        classification = automatic;
       } else if (manual) {
         classification = manual.classification;
         categoryId = classification === "business" ? manual.categoryId : null;
@@ -602,7 +648,7 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
         description_raw: string(transaction.descriptionRaw) || null,
         amount: absMoney(originalAmount),
         signed_amount: originalAmount,
-        transaction_type: string(transaction.type).toUpperCase() === "DEBIT" ? "DEBIT" : "CREDIT",
+        transaction_type: transactionTypeOf(transaction, accountType),
         status: string(transaction.status).toUpperCase() || "POSTED",
         operation_type: string(transaction.operationType).toUpperCase() || null,
         payment_method: string(paymentData?.paymentMethod).toUpperCase() || null,
@@ -661,6 +707,9 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     bankAccounts: bankAccounts.length,
     creditAccounts: creditAccounts.length,
     transactions: transactionCount,
+    creditCardTransactions,
+    creditCardPurchases,
+    creditCardWarningCodes,
     selectedAccountId: selectedAccountId || null,
     selectedAccountName: selectedAccount ? (string(selectedAccount.marketingName) || string(selectedAccount.name) || "Conta bancária") : null,
     selectedBalance: selectedAccount ? numberOrNull(selectedAccount.balance) : null,
