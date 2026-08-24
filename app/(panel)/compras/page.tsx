@@ -84,6 +84,14 @@ type ReceiverGroup = {
   total: Decimal;
 };
 
+type SpendRule = {
+  id: string;
+  match_key: string;
+  match_label: string;
+  classification: Exclude<Classification, "credit">;
+  category_id: string | null;
+};
+
 function formatDate(value: string) {
   return new Date(`${value}T12:00:00`).toLocaleDateString("pt-BR");
 }
@@ -155,9 +163,60 @@ function optionValue(row: PluggyTransaction) {
   return `special:${row.classification}`;
 }
 
-function groupValue(group: ReceiverGroup) {
+function normalizeIdentity(value: string | null | undefined) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function canonicalCardDescription(value: string | null | undefined) {
+  return normalizeIdentity(value)
+    .replace(/\bPARC(?:ELA)?\s*\d{1,2}\s*(?:DE|\/|-)\s*\d{1,2}\b/g, " ")
+    .replace(/\b\d{1,2}\s*(?:\/|-)\s*\d{1,2}\b/g, " ")
+    .replace(/\b\d{1,2}\s+DE\s+\d{1,2}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function digitsOnly(value: string | null | undefined) {
+  return String(value ?? "").replace(/\D/g, "");
+}
+
+function persistedOrFallbackMatchKey(row: PluggyTransaction) {
+  if (row.match_key?.trim()) return row.match_key.trim();
+
+  if (row.account_type === "CREDIT") {
+    const merchantCnpj = digitsOnly(row.merchant_cnpj);
+    if (merchantCnpj) return `merchant-doc:${merchantCnpj}`;
+
+    const merchant = row.merchant_name || row.merchant_business_name;
+    if (merchant) return `merchant:${normalizeIdentity(merchant)}`;
+
+    const canonical = canonicalCardDescription(row.description);
+    return `card-desc:${canonical || normalizeIdentity(row.description) || "MOVIMENTACAO BANCARIA"}`;
+  }
+
+  const receiverDocument = digitsOnly(row.receiver_document);
+  if (receiverDocument) return `receiver-doc:${receiverDocument}`;
+  if (row.receiver_name) return `receiver:${normalizeIdentity(row.receiver_name)}`;
+  return `bank-desc:${normalizeIdentity(row.description) || "MOVIMENTACAO BANCARIA"}`;
+}
+
+function ruleOptionValue(rule: SpendRule) {
+  if (rule.classification === "business" && rule.category_id) return `category:${rule.category_id}`;
+  return `special:${rule.classification}`;
+}
+
+function groupValue(group: ReceiverGroup, ruleMap: Map<string, SpendRule>) {
+  const savedRule = ruleMap.get(group.key);
+  if (savedRule) return ruleOptionValue(savedRule);
+
   const values = new Set(group.rows.map(optionValue));
-  return values.size === 1 ? Array.from(values)[0] : "";
+  return values.size === 1 ? Array.from(values)[0] : "special:review";
 }
 
 function ClassificationSelect({
@@ -220,6 +279,7 @@ export default function Compras() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [accounts, setAccounts] = useState<PluggyAccount[]>([]);
   const [transactions, setTransactions] = useState<PluggyTransaction[]>([]);
+  const [rules, setRules] = useState<SpendRule[]>([]);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [savingRowId, setSavingRowId] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -251,11 +311,12 @@ export default function Compras() {
     if (!connected) {
       setAccounts([]);
       setTransactions([]);
+      setRules([]);
       setPluggyLoading(false);
       return;
     }
 
-    const [accountResult, transactionResult] = await Promise.all([
+    const [accountResult, transactionResult, rulesResult] = await Promise.all([
       supabase
         .from("pluggy_bank_accounts")
         .select("pluggy_account_id,type,name,marketing_name,number_masked,balance,credit_limit,available_credit_limit,balance_close_date,balance_due_date,minimum_payment")
@@ -268,12 +329,18 @@ export default function Compras() {
         .gte("occurred_on", monthStart(month))
         .lt("occurred_on", nextMonthStart(month))
         .order("occurred_on", { ascending: false }),
+      supabase
+        .from("pluggy_spend_rules")
+        .select("id,match_key,match_label,classification,category_id")
+        .order("match_label"),
     ]);
 
     if (accountResult.error) toast.error(accountResult.error.message);
     if (transactionResult.error) toast.error(transactionResult.error.message);
+    if (rulesResult.error) toast.error(rulesResult.error.message);
     setAccounts((accountResult.data ?? []) as PluggyAccount[]);
     setTransactions((transactionResult.data ?? []) as PluggyTransaction[]);
+    setRules((rulesResult.data ?? []) as SpendRule[]);
     setPluggyLoading(false);
   }, [month]);
 
@@ -281,6 +348,7 @@ export default function Compras() {
 
   const accountMap = useMemo(() => new Map(accounts.map((row) => [row.pluggy_account_id, row])), [accounts]);
   const categoryMap = useMemo(() => new Map(categories.map((row) => [row.id, row])), [categories]);
+  const ruleMap = useMemo(() => new Map(rules.map((row) => [row.match_key, row])), [rules]);
   const creditAccounts = useMemo(() => accounts.filter((row) => row.type === "CREDIT"), [accounts]);
   const classifiableRows = useMemo(() => transactions.filter(isClassifiableOutflow), [transactions]);
   const businessRows = useMemo(() => classifiableRows.filter(isBusinessSpend), [classifiableRows]);
@@ -297,7 +365,7 @@ export default function Compras() {
   const receiverGroups = useMemo(() => {
     const grouped = new Map<string, ReceiverGroup>();
     for (const row of classifiableRows) {
-      const key = row.match_key || `transaction:${row.pluggy_transaction_id}`;
+      const key = persistedOrFallbackMatchKey(row);
       const label = counterparty(row);
       const current = grouped.get(key) ?? { key, label, rows: [], total: new Decimal(0) };
       current.rows.push(row);
@@ -346,18 +414,56 @@ export default function Compras() {
     const selection = parseSelection(value);
     if (!selection || savingKey) return;
     setSavingKey(group.key);
+
+    const optimisticRule: SpendRule = {
+      id: ruleMap.get(group.key)?.id ?? `optimistic:${group.key}`,
+      match_key: group.key,
+      match_label: group.label,
+      classification: selection.classification,
+      category_id: selection.categoryId,
+    };
+    const previousRules = rules;
+    const previousTransactions = transactions;
+
+    setRules((current) => {
+      const withoutCurrent = current.filter((rule) => rule.match_key !== group.key);
+      return [...withoutCurrent, optimisticRule];
+    });
+    setTransactions((current) => current.map((row) => {
+      if (!group.rows.some((groupRow) => groupRow.id === row.id)) return row;
+      if (row.classification_source === "manual") return row;
+      return {
+        ...row,
+        match_key: group.key,
+        match_label: row.match_label || group.label,
+        classification: selection.classification,
+        classification_source: "rule",
+        category_id: selection.classification === "business" ? selection.categoryId : null,
+      };
+    }));
+
     try {
       const supabase = createClient();
-      const { error } = await supabase.rpc("set_pluggy_spend_rule", {
+      const { data, error } = await supabase.rpc("set_pluggy_spend_rule_v2", {
         p_match_key: group.key,
         p_match_label: group.label,
         p_classification: selection.classification,
         p_category_id: selection.categoryId,
+        p_transaction_ids: group.rows.map((row) => row.pluggy_transaction_id),
       });
       if (error) throw error;
-      toast.success(`Regra salva para ${group.label}. Histórico e próximas movimentações usarão essa classificação.`);
-      setRefreshKey((value2) => value2 + 1);
+
+      const result = data && typeof data === "object" ? data as Record<string, unknown> : {};
+      const matchedRows = Number(result.matched_rows ?? 0);
+      if (!Number.isFinite(matchedRows) || matchedRows < 1) {
+        throw new Error("A regra foi criada, mas nenhuma movimentação correspondente foi localizada. Atualize os dados da Pluggy e tente novamente.");
+      }
+
+      await loadPluggy();
+      toast.success(`Regra salva para ${group.label}. A seleção foi confirmada no banco e será usada nas próximas movimentações.`);
     } catch (error: any) {
+      setRules(previousRules);
+      setTransactions(previousTransactions);
       toast.error(error?.message || "Falha ao salvar a regra.");
     } finally {
       setSavingKey(null);
@@ -450,13 +556,13 @@ export default function Compras() {
                         <TD className="font-medium">{formatBRL(group.total.toFixed(2))}</TD>
                         <TD>
                           <ClassificationSelect
-                            value={groupValue(group)}
+                            value={groupValue(group, ruleMap)}
                             categories={categories}
                             disabled={savingKey === group.key}
                             onChange={(value) => { void applyRule(group, value); }}
                           />
                           {group.rows.some((row) => row.classification_source === "manual") ? (
-                            <div className="mt-1 text-xs text-muted-foreground">Há exceção manual neste grupo.</div>
+                            <div className="mt-1 text-xs text-muted-foreground">Há exceção manual neste grupo; ela não altera a regra permanente acima.</div>
                           ) : null}
                         </TD>
                       </TR>
