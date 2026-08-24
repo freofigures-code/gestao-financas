@@ -473,14 +473,29 @@ async function getShopDaily(config: ShopeeConfig, day: string): Promise<Metric> 
     start_date: apiDate(day),
     end_date: apiDate(day),
   });
-  const response = obj(body.response);
-  if (!response) return emptyMetric();
 
-  const responseDate = parseApiDate(response.date, day);
-  if (responseDate !== day) {
-    throw new Error(`Shopee Ads retornou data ${responseDate} ao solicitar ${day}.`);
+  // A resposta real/documentada deste endpoint vem em `response: [ ... ]`.
+  // A versão anterior usava obj(body.response), que transforma arrays em null
+  // e fazia todos os indicadores GERAIS virarem zero, mesmo com Ads por produto.
+  const rows = Array.isArray(body.response)
+    ? arr(body.response)
+    : obj(body.response)
+      ? [obj(body.response)!]
+      : [];
+
+  if (rows.length === 0) return emptyMetric();
+
+  const matchingRows = rows.filter((row) => parseApiDate(row.date, "") === day);
+  if (matchingRows.length === 0) {
+    const returnedDates = rows.map((row) => str(row.date)).filter(Boolean).join(", ");
+    throw new Error(
+      `Shopee Ads não retornou a performance geral do dia ${day}. Datas retornadas: ${returnedDates || "nenhuma"}.`,
+    );
   }
-  return metricFromReport(response);
+
+  const total = emptyMetric();
+  for (const row of matchingRows) addMetric(total, metricFromReport(row));
+  return total;
 }
 
 async function getGmsItems(config: ShopeeConfig, from: string, to: string) {
