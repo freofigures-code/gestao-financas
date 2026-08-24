@@ -105,7 +105,8 @@ function decimal(value: string | number | null | undefined) {
 }
 
 function isCreditCharge(row: PluggyTransaction) {
-  return row.account_type === "CREDIT" && decimal(row.signed_amount).greaterThan(0);
+  // Em cartão, DEBIT identifica compra/gasto. Não filtramos pelo sinal do amount.
+  return row.account_type === "CREDIT" && row.transaction_type === "DEBIT";
 }
 
 function isBankOutflow(row: PluggyTransaction) {
