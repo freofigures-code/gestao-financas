@@ -12,6 +12,7 @@ const items = [
   ["/resumo", "Resumo"],
   ["/produtos", "Produtos"],
   ["/compras", "Compras"],
+  ["/shopee-ads", "Ads"],
   ["/analise-ia", "IA"],
   ["/configuracoes", "Config."],
 ];
@@ -22,7 +23,14 @@ export function MobileNav() {
     <nav className="overflow-x-auto border-b bg-background lg:hidden">
       <div className="flex min-w-max px-2">
         {items.map(([href, label]) => (
-          <Link key={href} href={href} className={cn("border-b-2 px-3 py-2.5 text-xs font-medium", pathname === href ? "border-primary text-primary" : "border-transparent text-muted-foreground")}>
+          <Link
+            key={href}
+            href={href}
+            className={cn(
+              "border-b-2 px-3 py-2.5 text-xs font-medium",
+              pathname === href ? "border-primary text-primary" : "border-transparent text-muted-foreground",
+            )}
+          >
             {label}
           </Link>
         ))}
