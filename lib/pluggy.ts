@@ -377,7 +377,11 @@ export function classifyPluggyTransaction(
   const signedAmount = roundMoney(transaction.amount);
 
   if (accountType === "CREDIT") {
-    return signedAmount > 0 ? "review" : "credit";
+    // Para cartão, `type` é o discriminador semântico: DEBIT = compra/gasto;
+    // CREDIT = crédito/estorno/pagamento. Não usamos o sinal do amount para decidir.
+    if (type === "DEBIT") return "review";
+    if (type === "CREDIT") return "credit";
+    return "review";
   }
 
   if (type === "CREDIT") return "credit";
