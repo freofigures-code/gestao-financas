@@ -1,663 +1,619 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Decimal from "decimal.js";
 import { useMonth } from "@/components/month-provider";
 import { useCashflow } from "@/hooks/use-cashflow";
-import { useMonthSummary } from "@/hooks/use-month-summary";
 import { CashEntryForm } from "@/components/cash-entry-form";
 import { MetricCard } from "@/components/metric-card";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Table, THead, TBody, TR, TH, TD } from "@/components/ui/table";
-import { createClient } from "@/lib/supabase/client";
 import { formatBRL } from "@/lib/money";
-import { toast } from "sonner";
+import { useCustomColumns } from "@/hooks/use-custom-columns";
+import { EntryActions } from "@/components/entry-actions";
+import { createClient } from "@/lib/supabase/client";
 import { monthStart, nextMonthStart } from "@/lib/date";
+import { toast } from "sonner";
 
-type BankAccount = {
-  id: string;
-  name: string;
-  kind: "bank" | "other";
-  opening_balance: string | number | null;
+const PAYMENT_METHOD_LABELS: Record<string, string> = {
+  credit: "Crédito",
+  installment: "A prazo",
+  debit: "Débito",
+  pix: "Pix",
 };
 
-type ShopeeWalletEntry = {
+type Classification = "business" | "personal" | "transfer" | "card_payment" | "credit" | "ignore" | "review";
+
+type Category = {
   id: string;
-  occurred_at: string;
-  create_time: number;
-  amount: string | number;
-  order_sn: string | null;
-  status: string;
-  money_flow: string | null;
-  transaction_type: string;
-  transaction_tab_type: string | null;
+  name: string;
+  impacts_result: boolean;
 };
 
 type PluggyAccount = {
   pluggy_account_id: string;
+  type: "BANK" | "CREDIT";
   name: string;
   marketing_name: string | null;
   number_masked: string | null;
   balance: string | number | null;
-  currency_code: string;
-  synced_at: string;
+  credit_limit: string | number | null;
+  available_credit_limit: string | number | null;
+  balance_close_date: string | null;
+  balance_due_date: string | null;
+  minimum_payment: string | number | null;
 };
-
-type PluggyClassification = "business" | "personal" | "credit" | "ignore" | "review";
 
 type PluggyTransaction = {
   id: string;
   pluggy_transaction_id: string;
-  occurred_at: string;
+  pluggy_account_id: string;
+  account_type: "BANK" | "CREDIT";
   occurred_on: string;
   description: string;
   amount: string | number;
+  signed_amount: string | number;
   transaction_type: "DEBIT" | "CREDIT";
   status: string;
   operation_type: string | null;
   payment_method: string | null;
   payer_name: string | null;
   receiver_name: string | null;
-  classification: PluggyClassification;
-  classification_source: "auto" | "manual";
+  payer_document: string | null;
+  receiver_document: string | null;
+  merchant_name: string | null;
+  merchant_business_name: string | null;
+  merchant_cnpj: string | null;
+  match_key: string | null;
+  match_label: string | null;
+  classification: Classification;
+  classification_source: "auto" | "rule" | "manual";
+  category_id: string | null;
+  installment_number: number | null;
+  total_installments: number | null;
+  total_amount: string | number | null;
+  bill_id: string | null;
+  bill_forecast_date: string | null;
 };
 
-type PluggyState = {
-  connected: boolean;
-  accountId: string;
-  lastSyncAt: string | null;
-  account: PluggyAccount | null;
+type ReceiverGroup = {
+  key: string;
+  label: string;
+  rows: PluggyTransaction[];
+  total: Decimal;
 };
-
-function accountOf(row: any) {
-  return Array.isArray(row.cash_accounts) ? row.cash_accounts[0] : row.cash_accounts;
-}
 
 function formatDate(value: string) {
   return new Date(`${value}T12:00:00`).toLocaleDateString("pt-BR");
 }
 
-function isShopeeSaleEntry(row: ShopeeWalletEntry) {
-  const status = String(row.status ?? "").toUpperCase();
-  const flow = String(row.money_flow ?? "").toUpperCase();
-  const tab = String(row.transaction_tab_type ?? "").toLowerCase();
-  const transactionType = String(row.transaction_type ?? "").toUpperCase();
-  const amount = new Decimal(String(row.amount ?? 0));
-
-  return (
-    status === "COMPLETED" &&
-    flow === "MONEY_IN" &&
-    amount.greaterThan(0) &&
-    (tab === "wallet_order_income" || transactionType === "101" || transactionType === "ESCROW_VERIFIED_ADD")
-  );
-}
-
-function isRegisteredPaidExpense(row: any) {
-  return row.source_type === "expense_installment" && row.direction === "out";
-}
-
-function shopeeEntryDescription(row: ShopeeWalletEntry) {
-  const orderSn = String(row.order_sn ?? "").trim();
-  return orderSn ? `Pedido ${orderSn}` : "Venda liberada pela Shopee";
-}
-
-function transferBaseKey(row: any) {
-  return String(row.source_key ?? row.id).replace(/:(wallet|transit|bank)$/i, "");
-}
-
-type TransferGroup = {
-  key: string;
-  date: string;
-  amount: string;
-  from: string;
-  to: string;
-  description: string;
-};
-
-function groupTransfers(rows: any[]): TransferGroup[] {
-  const grouped = new Map<string, any[]>();
-
-  for (const row of rows) {
-    if (row.movement_kind !== "transfer") continue;
-    const key = transferBaseKey(row);
-    const current = grouped.get(key) ?? [];
-    current.push(row);
-    grouped.set(key, current);
+function decimal(value: string | number | null | undefined) {
+  try {
+    return new Decimal(String(value ?? 0));
+  } catch {
+    return new Decimal(0);
   }
-
-  return Array.from(grouped.entries())
-    .map(([key, group]) => {
-      const outRow = group.find((row) => row.direction === "out");
-      const inRow = group.find((row) => row.direction === "in");
-      const first = group[0];
-      const outAccount = outRow ? accountOf(outRow) : null;
-      const inAccount = inRow ? accountOf(inRow) : null;
-
-      let description = "Transferência entre contas";
-      const kinds = new Set(group.map((row) => accountOf(row)?.kind));
-      if (kinds.has("shopee_wallet") && kinds.has("transit")) description = "Saque Shopee iniciado";
-      if (kinds.has("transit") && kinds.has("bank")) description = "Saque Shopee recebido no banco";
-      if (outAccount?.kind === "transit" && inAccount?.kind === "shopee_wallet") description = "Saque Shopee cancelado";
-
-      return {
-        key,
-        date: first?.occurred_at ?? "",
-        amount: String(first?.amount ?? "0"),
-        from: outAccount?.name ?? "—",
-        to: inAccount?.name ?? "—",
-        description,
-      };
-    })
-    .sort((a, b) => b.date.localeCompare(a.date));
 }
 
-function normalizeMoney(value: string) {
-  const normalized = value.trim().replace(",", ".");
-  const decimal = new Decimal(normalized || "0");
-  if (!decimal.isFinite()) throw new Error("Valor inválido.");
-  return decimal.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2);
+function isCreditCharge(row: PluggyTransaction) {
+  return row.account_type === "CREDIT" && decimal(row.signed_amount).greaterThan(0);
 }
 
-function classificationLabel(value: PluggyClassification) {
-  if (value === "business") return "Gasto Freo Figures";
-  if (value === "personal") return "Retirada pessoal";
-  if (value === "credit") return "Entrada bancária";
-  if (value === "ignore") return "Ignorar";
-  return "Revisar";
+function isBankOutflow(row: PluggyTransaction) {
+  return row.account_type === "BANK" && row.status === "POSTED" && row.transaction_type === "DEBIT";
+}
+
+function isClassifiableOutflow(row: PluggyTransaction) {
+  return isCreditCharge(row) || isBankOutflow(row);
+}
+
+function isBusinessSpend(row: PluggyTransaction) {
+  return isClassifiableOutflow(row) && row.classification === "business" && Boolean(row.category_id);
+}
+
+function accountName(account: PluggyAccount | undefined) {
+  if (!account) return "—";
+  return `${account.marketing_name || account.name}${account.number_masked ? ` · ${account.number_masked}` : ""}`;
+}
+
+function sourceLabel(row: PluggyTransaction) {
+  if (row.account_type === "CREDIT") return "Cartão de crédito";
+  return row.payment_method || row.operation_type || "Conta bancária";
 }
 
 function counterparty(row: PluggyTransaction) {
-  if (row.transaction_type === "DEBIT") return row.receiver_name || "—";
-  return row.payer_name || "—";
+  if (row.account_type === "CREDIT") return row.merchant_name || row.merchant_business_name || row.match_label || row.description;
+  if (row.transaction_type === "DEBIT") return row.receiver_name || row.match_label || row.description;
+  return row.payer_name || row.match_label || row.description;
 }
 
-export default function Fluxo() {
+function documentOf(row: PluggyTransaction) {
+  if (row.account_type === "CREDIT") return row.merchant_cnpj || null;
+  return row.transaction_type === "DEBIT" ? row.receiver_document : row.payer_document;
+}
+
+function installmentLabel(row: PluggyTransaction) {
+  if (row.account_type !== "CREDIT") return "—";
+  if (row.installment_number && row.total_installments) return `${row.installment_number}/${row.total_installments}`;
+  return "À vista / não informado";
+}
+
+function classificationLabel(row: PluggyTransaction, categoryMap: Map<string, Category>) {
+  if (row.classification === "business") return row.category_id ? categoryMap.get(row.category_id)?.name ?? "Categoria removida" : "Gasto sem categoria";
+  if (row.classification === "personal") return "Retirada pessoal";
+  if (row.classification === "transfer") return "Transferência";
+  if (row.classification === "card_payment") return "Pagamento de fatura";
+  if (row.classification === "ignore") return "Ignorar";
+  if (row.classification === "credit") return "Crédito / estorno";
+  return "Não classificado";
+}
+
+function optionValue(row: PluggyTransaction) {
+  if (row.classification === "business" && row.category_id) return `category:${row.category_id}`;
+  if (row.classification === "credit") return "special:ignore";
+  return `special:${row.classification}`;
+}
+
+function groupValue(group: ReceiverGroup) {
+  const values = new Set(group.rows.map(optionValue));
+  return values.size === 1 ? Array.from(values)[0] : "";
+}
+
+function ClassificationSelect({
+  value,
+  categories,
+  disabled,
+  onChange,
+}: {
+  value: string;
+  categories: Category[];
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <select
+      className="h-9 min-w-52 rounded-md border bg-background px-2 text-sm"
+      value={value}
+      disabled={disabled}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <option value="">Selecione...</option>
+      <optgroup label="Categorias de gasto">
+        {categories.map((category) => (
+          <option key={category.id} value={`category:${category.id}`}>{category.name}</option>
+        ))}
+      </optgroup>
+      <optgroup label="Não é gasto empresarial">
+        <option value="special:personal">Retirada pessoal</option>
+        <option value="special:transfer">Transferência entre contas</option>
+        <option value="special:card_payment">Pagamento de fatura</option>
+        <option value="special:ignore">Ignorar</option>
+        <option value="special:review">Não classificado</option>
+      </optgroup>
+    </select>
+  );
+}
+
+function parseSelection(value: string): { classification: Exclude<Classification, "credit">; categoryId: string | null } | null {
+  if (value.startsWith("category:")) {
+    const categoryId = value.slice("category:".length).trim();
+    return categoryId ? { classification: "business", categoryId } : null;
+  }
+  if (value.startsWith("special:")) {
+    const classification = value.slice("special:".length) as Exclude<Classification, "credit">;
+    if (["personal", "transfer", "card_payment", "ignore", "review"].includes(classification)) {
+      return { classification, categoryId: null };
+    }
+  }
+  return null;
+}
+
+export default function Compras() {
   const { month } = useMonth();
-  const { movements, loading, error, refresh } = useCashflow(month);
-  const { summary } = useMonthSummary(month);
+  const { expenses, loading: manualLoading, error: manualError, refresh: refreshManual } = useCashflow(month);
+  const columns = useCustomColumns("expenses");
 
-  const [bankCashBalance, setBankCashBalance] = useState("0.00");
-  const [positionLoading, setPositionLoading] = useState(true);
-  const [positionRefreshKey, setPositionRefreshKey] = useState(0);
-  const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
-  const [selectedBankAccountId, setSelectedBankAccountId] = useState("");
-  const [openingBalanceInput, setOpeningBalanceInput] = useState("0.00");
-  const [savingOpeningBalance, setSavingOpeningBalance] = useState(false);
-  const [walletEntries, setWalletEntries] = useState<ShopeeWalletEntry[]>([]);
-  const [walletEntriesLoading, setWalletEntriesLoading] = useState(true);
-  const [walletEntriesError, setWalletEntriesError] = useState<string | null>(null);
-
-  const [pluggy, setPluggy] = useState<PluggyState>({ connected: false, accountId: "", lastSyncAt: null, account: null });
-  const [pluggyTransactions, setPluggyTransactions] = useState<PluggyTransaction[]>([]);
+  const [pluggyConnected, setPluggyConnected] = useState(false);
   const [pluggyLoading, setPluggyLoading] = useState(true);
   const [pluggySyncing, setPluggySyncing] = useState(false);
-  const [classificationSavingId, setClassificationSavingId] = useState<string | null>(null);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [accounts, setAccounts] = useState<PluggyAccount[]>([]);
+  const [transactions, setTransactions] = useState<PluggyTransaction[]>([]);
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [savingRowId, setSavingRowId] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  const shopeeEntries = useMemo(() => walletEntries.filter((row) => isShopeeSaleEntry(row)), [walletEntries]);
-  const registeredPaidExpenses = useMemo(() => movements.filter((row: any) => isRegisteredPaidExpense(row)), [movements]);
-  const transferGroups = useMemo(() => groupTransfers(movements), [movements]);
+  const loadPluggy = useCallback(async () => {
+    setPluggyLoading(true);
+    const supabase = createClient();
+    const [settingsResult, categoriesResult] = await Promise.all([
+      supabase.from("integration_settings").select("pluggy_item_id").single(),
+      supabase.from("categories").select("id,name,impacts_result").eq("type", "expense").order("name"),
+    ]);
 
-  const shopeeEntriesTotal = useMemo(
-    () => shopeeEntries.reduce((sum: Decimal, row) => sum.plus(row.amount), new Decimal(0)),
-    [shopeeEntries],
-  );
-
-  const pluggyBusinessExpenses = useMemo(
-    () => pluggyTransactions.filter((row) => row.status === "POSTED" && row.transaction_type === "DEBIT" && row.classification === "business"),
-    [pluggyTransactions],
-  );
-  const pluggyPersonalWithdrawals = useMemo(
-    () => pluggyTransactions.filter((row) => row.status === "POSTED" && row.transaction_type === "DEBIT" && row.classification === "personal"),
-    [pluggyTransactions],
-  );
-  const pluggyReviewCount = useMemo(
-    () => pluggyTransactions.filter((row) => row.transaction_type === "DEBIT" && row.classification === "review").length,
-    [pluggyTransactions],
-  );
-
-  const manualPaidExpensesTotal = useMemo(
-    () => registeredPaidExpenses.reduce((sum: Decimal, row: any) => sum.plus(row.amount), new Decimal(0)),
-    [registeredPaidExpenses],
-  );
-  const pluggyBusinessExpensesTotal = useMemo(
-    () => pluggyBusinessExpenses.reduce((sum: Decimal, row) => sum.plus(row.amount), new Decimal(0)),
-    [pluggyBusinessExpenses],
-  );
-  const pluggyPersonalTotal = useMemo(
-    () => pluggyPersonalWithdrawals.reduce((sum: Decimal, row) => sum.plus(row.amount), new Decimal(0)),
-    [pluggyPersonalWithdrawals],
-  );
-
-  const paidExpensesTotal = pluggy.connected ? pluggyBusinessExpensesTotal : manualPaidExpensesTotal;
-  const bankCardLabel = pluggy.connected ? "Saldo Nubank PJ atual" : "Banco / caixa disponível";
-  const bankCardValue = pluggy.connected
-    ? (pluggy.account ? formatBRL(String(pluggy.account.balance ?? "0")) : "Selecione a conta")
-    : (positionLoading ? "Calculando..." : formatBRL(bankCashBalance));
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadWalletEntries() {
-      setWalletEntriesLoading(true);
-      setWalletEntriesError(null);
-      const supabase = createClient();
-      const result = await supabase
-        .from("shopee_wallet_transactions")
-        .select("id,occurred_at,create_time,amount,order_sn,status,money_flow,transaction_type,transaction_tab_type")
-        .gte("occurred_at", monthStart(month))
-        .lt("occurred_at", nextMonthStart(month))
-        .order("create_time", { ascending: false });
-
-      if (cancelled) return;
-      if (result.error) {
-        setWalletEntries([]);
-        setWalletEntriesError(result.error.message);
-        setWalletEntriesLoading(false);
-        return;
-      }
-      setWalletEntries((result.data ?? []) as ShopeeWalletEntry[]);
-      setWalletEntriesLoading(false);
-    }
-
-    void loadWalletEntries();
-    return () => { cancelled = true; };
-  }, [month, positionRefreshKey]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadPluggy() {
-      setPluggyLoading(true);
-      const supabase = createClient();
-      const settingsResult = await supabase
-        .from("integration_settings")
-        .select("pluggy_item_id,pluggy_account_id,pluggy_last_sync_at")
-        .single();
-
-      if (cancelled) return;
-      if (settingsResult.error) {
-        toast.error(settingsResult.error.message);
-        setPluggy({ connected: false, accountId: "", lastSyncAt: null, account: null });
-        setPluggyTransactions([]);
-        setPluggyLoading(false);
-        return;
-      }
-
-      const itemId = String(settingsResult.data?.pluggy_item_id ?? "").trim();
-      const accountId = String(settingsResult.data?.pluggy_account_id ?? "").trim();
-      const lastSyncAt = settingsResult.data?.pluggy_last_sync_at ? String(settingsResult.data.pluggy_last_sync_at) : null;
-      if (!itemId) {
-        setPluggy({ connected: false, accountId: "", lastSyncAt, account: null });
-        setPluggyTransactions([]);
-        setPluggyLoading(false);
-        return;
-      }
-
-      let account: PluggyAccount | null = null;
-      if (accountId) {
-        const accountResult = await supabase
-          .from("pluggy_bank_accounts")
-          .select("pluggy_account_id,name,marketing_name,number_masked,balance,currency_code,synced_at")
-          .eq("pluggy_account_id", accountId)
-          .maybeSingle();
-        if (cancelled) return;
-        if (accountResult.error) {
-          toast.error(accountResult.error.message);
-        } else if (accountResult.data) {
-          account = accountResult.data as PluggyAccount;
-        }
-      }
-
-      let transactions: PluggyTransaction[] = [];
-      if (accountId) {
-        const transactionResult = await supabase
-          .from("pluggy_bank_transactions")
-          .select("id,pluggy_transaction_id,occurred_at,occurred_on,description,amount,transaction_type,status,operation_type,payment_method,payer_name,receiver_name,classification,classification_source")
-          .eq("pluggy_account_id", accountId)
-          .gte("occurred_on", monthStart(month))
-          .lt("occurred_on", nextMonthStart(month))
-          .order("occurred_at", { ascending: false });
-        if (cancelled) return;
-        if (transactionResult.error) toast.error(transactionResult.error.message);
-        else transactions = (transactionResult.data ?? []) as PluggyTransaction[];
-      }
-
-      setPluggy({ connected: true, accountId, lastSyncAt, account });
-      setPluggyTransactions(transactions);
+    if (settingsResult.error) {
+      toast.error(settingsResult.error.message);
+      setPluggyConnected(false);
       setPluggyLoading(false);
+      return;
     }
-
-    void loadPluggy();
-    return () => { cancelled = true; };
-  }, [month, positionRefreshKey]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadManualBankPosition() {
-      if (pluggy.connected) {
-        setPositionLoading(false);
-        return;
-      }
-      setPositionLoading(true);
-      const supabase = createClient();
-      const accountsResult = await supabase
-        .from("cash_accounts")
-        .select("id,name,kind,opening_balance")
-        .in("kind", ["bank", "other"])
-        .eq("active", true)
-        .order("created_at");
-
-      if (cancelled) return;
-      if (accountsResult.error) {
-        toast.error(accountsResult.error.message);
-        setBankAccounts([]);
-        setBankCashBalance("0.00");
-        setPositionLoading(false);
-        return;
-      }
-
-      const rows = (accountsResult.data ?? []) as BankAccount[];
-      setBankAccounts(rows);
-      setSelectedBankAccountId((current) => current && rows.some((row) => row.id === current) ? current : rows[0]?.id ?? "");
-      const openingTotal = rows.reduce((sum, account) => sum.plus(String(account.opening_balance ?? 0)), new Decimal(0));
-
-      if (rows.length === 0) {
-        setBankCashBalance(openingTotal.toFixed(2));
-        setPositionLoading(false);
-        return;
-      }
-
-      const movementResult = await supabase
-        .from("cash_movements")
-        .select("account_id,direction,amount")
-        .in("account_id", rows.map((account) => account.id))
-        .lt("occurred_at", nextMonthStart(month));
-
-      if (cancelled) return;
-      if (movementResult.error) {
-        toast.error(movementResult.error.message);
-        setBankCashBalance(openingTotal.toFixed(2));
-        setPositionLoading(false);
-        return;
-      }
-
-      const movementTotal = (movementResult.data ?? []).reduce((sum: Decimal, movement: any) => {
-        const amount = new Decimal(String(movement.amount ?? 0));
-        return movement.direction === "in" ? sum.plus(amount) : sum.minus(amount);
-      }, new Decimal(0));
-      setBankCashBalance(openingTotal.plus(movementTotal).toDecimalPlaces(2).toFixed(2));
-      setPositionLoading(false);
-    }
-
-    void loadManualBankPosition();
-    return () => { cancelled = true; };
-  }, [month, positionRefreshKey, pluggy.connected]);
-
-  useEffect(() => {
-    const selected = bankAccounts.find((account) => account.id === selectedBankAccountId);
-    if (selected) setOpeningBalanceInput(String(selected.opening_balance ?? "0"));
-  }, [bankAccounts, selectedBankAccountId]);
-
-  async function refreshAll() {
-    await refresh();
-    setPositionRefreshKey((value) => value + 1);
-  }
-
-  async function saveOpeningBalance() {
-    if (!selectedBankAccountId || savingOpeningBalance) return;
-    let value: string;
-    try {
-      value = normalizeMoney(openingBalanceInput);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Saldo inicial inválido.");
+    if (categoriesResult.error) {
+      toast.error(categoriesResult.error.message);
+      setPluggyLoading(false);
       return;
     }
 
-    setSavingOpeningBalance(true);
-    try {
-      const supabase = createClient();
-      const { error: updateError } = await supabase
-        .from("cash_accounts")
-        .update({ opening_balance: value, updated_at: new Date().toISOString() })
-        .eq("id", selectedBankAccountId);
-      if (updateError) return toast.error(updateError.message);
-      toast.success("Saldo inicial salvo.");
-      setPositionRefreshKey((current) => current + 1);
-    } finally {
-      setSavingOpeningBalance(false);
-    }
-  }
+    const connected = Boolean(String(settingsResult.data?.pluggy_item_id ?? "").trim());
+    setPluggyConnected(connected);
+    setCategories((categoriesResult.data ?? []) as Category[]);
 
-  async function syncPluggyMirror() {
+    if (!connected) {
+      setAccounts([]);
+      setTransactions([]);
+      setPluggyLoading(false);
+      return;
+    }
+
+    const [accountResult, transactionResult] = await Promise.all([
+      supabase
+        .from("pluggy_bank_accounts")
+        .select("pluggy_account_id,type,name,marketing_name,number_masked,balance,credit_limit,available_credit_limit,balance_close_date,balance_due_date,minimum_payment")
+        .in("type", ["BANK", "CREDIT"])
+        .order("type")
+        .order("name"),
+      supabase
+        .from("pluggy_bank_transactions")
+        .select("id,pluggy_transaction_id,pluggy_account_id,account_type,occurred_on,description,amount,signed_amount,transaction_type,status,operation_type,payment_method,payer_name,receiver_name,payer_document,receiver_document,merchant_name,merchant_business_name,merchant_cnpj,match_key,match_label,classification,classification_source,category_id,installment_number,total_installments,total_amount,bill_id,bill_forecast_date")
+        .gte("occurred_on", monthStart(month))
+        .lt("occurred_on", nextMonthStart(month))
+        .order("occurred_on", { ascending: false }),
+    ]);
+
+    if (accountResult.error) toast.error(accountResult.error.message);
+    if (transactionResult.error) toast.error(transactionResult.error.message);
+    setAccounts((accountResult.data ?? []) as PluggyAccount[]);
+    setTransactions((transactionResult.data ?? []) as PluggyTransaction[]);
+    setPluggyLoading(false);
+  }, [month]);
+
+  useEffect(() => { void loadPluggy(); }, [loadPluggy, refreshKey]);
+
+  const accountMap = useMemo(() => new Map(accounts.map((row) => [row.pluggy_account_id, row])), [accounts]);
+  const categoryMap = useMemo(() => new Map(categories.map((row) => [row.id, row])), [categories]);
+  const creditAccounts = useMemo(() => accounts.filter((row) => row.type === "CREDIT"), [accounts]);
+  const classifiableRows = useMemo(() => transactions.filter(isClassifiableOutflow), [transactions]);
+  const businessRows = useMemo(() => classifiableRows.filter(isBusinessSpend), [classifiableRows]);
+  const unclassifiedRows = useMemo(() => classifiableRows.filter((row) => row.classification === "review"), [classifiableRows]);
+  const personalRows = useMemo(() => classifiableRows.filter((row) => row.classification === "personal"), [classifiableRows]);
+  const creditCardBusinessRows = useMemo(() => businessRows.filter((row) => row.account_type === "CREDIT"), [businessRows]);
+  const bankBusinessRows = useMemo(() => businessRows.filter((row) => row.account_type === "BANK"), [businessRows]);
+
+  const businessTotal = useMemo(() => businessRows.reduce((sum, row) => sum.plus(row.amount), new Decimal(0)), [businessRows]);
+  const creditCardTotal = useMemo(() => creditCardBusinessRows.reduce((sum, row) => sum.plus(row.amount), new Decimal(0)), [creditCardBusinessRows]);
+  const bankBusinessTotal = useMemo(() => bankBusinessRows.reduce((sum, row) => sum.plus(row.amount), new Decimal(0)), [bankBusinessRows]);
+  const personalTotal = useMemo(() => personalRows.reduce((sum, row) => sum.plus(row.amount), new Decimal(0)), [personalRows]);
+
+  const receiverGroups = useMemo(() => {
+    const grouped = new Map<string, ReceiverGroup>();
+    for (const row of classifiableRows) {
+      const key = row.match_key || `transaction:${row.pluggy_transaction_id}`;
+      const label = counterparty(row);
+      const current = grouped.get(key) ?? { key, label, rows: [], total: new Decimal(0) };
+      current.rows.push(row);
+      current.total = current.total.plus(row.amount);
+      if (!current.label || current.label === "—") current.label = label;
+      grouped.set(key, current);
+    }
+    return Array.from(grouped.values()).sort((a, b) => {
+      const aReview = a.rows.some((row) => row.classification === "review") ? 1 : 0;
+      const bReview = b.rows.some((row) => row.classification === "review") ? 1 : 0;
+      if (aReview !== bReview) return bReview - aReview;
+      return b.total.comparedTo(a.total);
+    });
+  }, [classifiableRows]);
+
+  const categoryTotals = useMemo(() => {
+    const totals = new Map<string, Decimal>();
+    for (const row of businessRows) {
+      if (!row.category_id) continue;
+      totals.set(row.category_id, (totals.get(row.category_id) ?? new Decimal(0)).plus(row.amount));
+    }
+    return Array.from(totals.entries())
+      .map(([categoryId, total]) => ({ categoryId, name: categoryMap.get(categoryId)?.name ?? "Categoria removida", total }))
+      .sort((a, b) => b.total.comparedTo(a.total));
+  }, [businessRows, categoryMap]);
+
+  async function syncPluggy() {
     if (pluggySyncing) return;
     setPluggySyncing(true);
     try {
       const response = await fetch("/api/integrations/pluggy/pull", { method: "POST" });
-      const body = await response.json().catch(() => ({})) as { error?: unknown; sync?: { transactions?: unknown } };
+      const body = await response.json().catch(() => ({})) as { error?: unknown; sync?: { transactions?: unknown; creditAccounts?: unknown } };
       if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
       const count = typeof body.sync?.transactions === "number" ? body.sync.transactions : 0;
-      toast.success(`Dados do Nubank copiados da Pluggy: ${count} transação(ões).`);
-      setPositionRefreshKey((current) => current + 1);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Falha ao sincronizar os dados do Nubank.");
+      const cards = typeof body.sync?.creditAccounts === "number" ? body.sync.creditAccounts : 0;
+      toast.success(`Pluggy atualizada: ${count} transação(ões), ${cards} cartão(ões).`);
+      setRefreshKey((value) => value + 1);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Falha ao atualizar dados da Pluggy.");
     } finally {
       setPluggySyncing(false);
     }
   }
 
-  async function changeClassification(rowId: string, classification: "business" | "personal" | "ignore" | "review") {
-    if (classificationSavingId) return;
-    setClassificationSavingId(rowId);
-    const previous = pluggyTransactions;
-    setPluggyTransactions((rows) => rows.map((row) => row.id === rowId ? { ...row, classification, classification_source: "manual" } : row));
+  async function applyRule(group: ReceiverGroup, value: string) {
+    const selection = parseSelection(value);
+    if (!selection || savingKey) return;
+    setSavingKey(group.key);
     try {
       const supabase = createClient();
-      const { error: updateError } = await supabase
-        .from("pluggy_bank_transactions")
-        .update({ classification, classification_source: "manual" })
-        .eq("id", rowId);
-      if (updateError) throw updateError;
-      toast.success("Classificação salva.");
-    } catch (err: any) {
-      setPluggyTransactions(previous);
-      toast.error(err?.message || "Falha ao salvar a classificação.");
+      const { error } = await supabase.rpc("set_pluggy_spend_rule", {
+        p_match_key: group.key,
+        p_match_label: group.label,
+        p_classification: selection.classification,
+        p_category_id: selection.categoryId,
+      });
+      if (error) throw error;
+      toast.success(`Regra salva para ${group.label}. Histórico e próximas movimentações usarão essa classificação.`);
+      setRefreshKey((value2) => value2 + 1);
+    } catch (error: any) {
+      toast.error(error?.message || "Falha ao salvar a regra.");
     } finally {
-      setClassificationSavingId(null);
+      setSavingKey(null);
+    }
+  }
+
+  async function applyOne(row: PluggyTransaction, value: string) {
+    const selection = parseSelection(value);
+    if (!selection || savingRowId) return;
+    setSavingRowId(row.id);
+    try {
+      const supabase = createClient();
+      const { error } = await supabase.rpc("set_pluggy_transaction_classification", {
+        p_transaction_row_id: row.id,
+        p_classification: selection.classification,
+        p_category_id: selection.categoryId,
+      });
+      if (error) throw error;
+      toast.success("Exceção salva somente para esta movimentação.");
+      setRefreshKey((value2) => value2 + 1);
+    } catch (error: any) {
+      toast.error(error?.message || "Falha ao classificar a movimentação.");
+    } finally {
+      setSavingRowId(null);
     }
   }
 
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="text-2xl font-bold">Fluxo de Caixa</h1>
-        <p className="text-sm text-muted-foreground">
-          Entradas são vendas liberadas na Carteira Shopee. {pluggy.connected ? "Saídas e saldo bancário vêm da conta Nubank PJ vinculada pela Pluggy." : "Saídas são os pagamentos cadastrados manualmente no painel."}
-        </p>
-      </div>
-
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <MetricCard label="Entradas Shopee no mês" value={formatBRL(shopeeEntriesTotal.toFixed(2))} />
-        <MetricCard label="Saídas pagas no mês" value={pluggyLoading ? "Carregando..." : formatBRL(paidExpensesTotal.toFixed(2))} />
-        <MetricCard label={bankCardLabel} value={pluggyLoading ? "Carregando..." : bankCardValue} />
-        <MetricCard label="Saldo Carteira Shopee" value={formatBRL(summary?.shopee_wallet_balance ?? "0")} />
-      </div>
-
-      <Card>
-        <CardContent className="space-y-2 pt-5 text-sm text-muted-foreground">
-          <p><span className="font-medium text-foreground">Entradas:</span> somente dinheiro de pedidos que a Shopee liberou na carteira durante o mês.</p>
-          {pluggy.connected ? (
-            <>
-              <p><span className="font-medium text-foreground">Saídas:</span> débitos POSTED do Nubank PJ classificados como gasto da Freo Figures. Pix para o destinatário pessoal configurado fica separado.</p>
-              <p><span className="font-medium text-foreground">Saldo Nubank PJ:</span> saldo disponível atual retornado pela conta bancária sincronizada na Pluggy; não é uma estimativa do painel.</p>
-              <p><span className="font-medium text-foreground">Retiradas pessoais neste mês:</span> {formatBRL(pluggyPersonalTotal.toFixed(2))}. Elas reduzem o saldo bancário, mas não entram em “Saídas pagas”.</p>
-              {pluggyReviewCount > 0 ? <p className="font-medium text-amber-700">Há {pluggyReviewCount} débito(s) para revisar antes de entrar nos custos.</p> : null}
-            </>
-          ) : (
-            <>
-              <p><span className="font-medium text-foreground">Saídas:</span> gastos cadastrados por você e efetivamente pagos.</p>
-              <p><span className="font-medium text-foreground">Banco / caixa disponível:</span> saldo inicial + movimentações manuais registradas até o fim do mês.</p>
-            </>
-          )}
-          <p><span className="font-medium text-foreground">Saque da Shopee:</span> é transferência para o banco; não aumenta “Entradas Shopee” e não vira despesa.</p>
-        </CardContent>
-      </Card>
-
-      {pluggy.connected ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Nubank PJ sincronizado</CardTitle>
-            <p className="text-sm text-muted-foreground">
-              {pluggy.account ? `${pluggy.account.marketing_name || pluggy.account.name}${pluggy.account.number_masked ? ` · ${pluggy.account.number_masked}` : ""}` : "Conta ainda não selecionada em Configurações."}
-              {pluggy.lastSyncAt ? ` · cópia para o painel em ${new Date(pluggy.lastSyncAt).toLocaleString("pt-BR")}` : ""}
-            </p>
-          </CardHeader>
-          <CardContent className="flex flex-wrap items-center gap-3">
-            <Button type="button" variant="outline" disabled={pluggySyncing} onClick={() => { void syncPluggyMirror(); }}>
-              {pluggySyncing ? "Sincronizando..." : "Atualizar dados da Pluggy"}
-            </Button>
-            <span className="text-xs text-muted-foreground">Para renovar/reautorizar a conexão Open Finance, use Configurações → Nubank PJ.</span>
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="grid gap-4 xl:grid-cols-[1.4fr_1fr]">
-          <Card>
-            <CardHeader><CardTitle>Adicionar custo / investimento / saída</CardTitle></CardHeader>
-            <CardContent><CashEntryForm type="expense" month={month} onDone={() => { void refreshAll(); }} /></CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle>Saldo inicial do banco / caixa</CardTitle>
-              <p className="text-sm text-muted-foreground">Use somente enquanto o Nubank PJ não estiver integrado.</p>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {bankAccounts.length === 0 ? <p className="text-sm text-muted-foreground">Nenhuma conta bancária/caixa encontrada.</p> : (
-                <>
-                  <select className="h-10 w-full rounded-md border bg-background px-3 text-sm" value={selectedBankAccountId} onChange={(event) => setSelectedBankAccountId(event.target.value)}>
-                    {bankAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
-                  </select>
-                  <Input type="text" inputMode="decimal" value={openingBalanceInput} onChange={(event) => setOpeningBalanceInput(event.target.value)} placeholder="0,00" />
-                  <Button type="button" disabled={savingOpeningBalance} onClick={() => { void saveOpeningBalance(); }}>{savingOpeningBalance ? "Salvando..." : "Salvar saldo inicial"}</Button>
-                </>
-              )}
-            </CardContent>
-          </Card>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold">Compras e Investimentos do Mês</h1>
+          <p className="text-sm text-muted-foreground">
+            Classifique cada recebedor/estabelecimento uma vez. A regra é reaplicada ao histórico e às próximas movimentações do mesmo identificador.
+          </p>
         </div>
-      )}
+        {pluggyConnected ? (
+          <Button type="button" variant="outline" disabled={pluggySyncing} onClick={() => { void syncPluggy(); }}>
+            {pluggySyncing ? "Sincronizando Nubank..." : "Atualizar Nubank / Pluggy"}
+          </Button>
+        ) : null}
+      </div>
 
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      {walletEntriesError ? <p className="text-sm text-destructive">{walletEntriesError}</p> : null}
+      {pluggyConnected ? (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            <MetricCard label="Gastos classificados" value={pluggyLoading ? "Carregando..." : formatBRL(businessTotal.toFixed(2))} />
+            <MetricCard label="No cartão" value={pluggyLoading ? "Carregando..." : formatBRL(creditCardTotal.toFixed(2))} />
+            <MetricCard label="Pix / débito / boleto" value={pluggyLoading ? "Carregando..." : formatBRL(bankBusinessTotal.toFixed(2))} />
+            <MetricCard label="Retiradas pessoais" value={pluggyLoading ? "Carregando..." : formatBRL(personalTotal.toFixed(2))} />
+            <MetricCard label="Não classificados" value={pluggyLoading ? "..." : String(unclassifiedRows.length)} />
+          </div>
 
-      <div className="grid gap-4 xl:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Entradas da Shopee na carteira</CardTitle>
-            <p className="text-sm text-muted-foreground">Somente liberações de pedidos da Shopee no mês selecionado.</p>
-          </CardHeader>
-          <CardContent className="overflow-x-auto p-0">
-            <Table>
-              <THead><TR><TH>Data</TH><TH>Pedido</TH><TH>Valor</TH></TR></THead>
-              <TBody>
-                {walletEntriesLoading ? <TR><TD colSpan={3}>Carregando entradas...</TD></TR> : shopeeEntries.length === 0 ? (
-                  <TR><TD colSpan={3} className="text-muted-foreground">Nenhuma venda liberada na carteira neste mês.</TD></TR>
-                ) : shopeeEntries.map((row) => (
-                  <TR key={row.id}><TD>{formatDate(row.occurred_at)}</TD><TD>{shopeeEntryDescription(row)}</TD><TD className="font-medium">{formatBRL(row.amount)}</TD></TR>
-                ))}
-              </TBody>
-            </Table>
-          </CardContent>
-        </Card>
+          {unclassifiedRows.length > 0 ? (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+              Existem <b>{unclassifiedRows.length}</b> movimentação(ões) sem categoria. Enquanto esse número não for zero, as métricas por categoria ainda não estão fechadas.
+            </div>
+          ) : (
+            <div className="rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm text-emerald-900">
+              Todas as saídas/compras reconhecidas deste mês estão classificadas.
+            </div>
+          )}
 
-        {pluggy.connected ? (
           <Card>
             <CardHeader>
-              <CardTitle>Resumo dos débitos Nubank PJ</CardTitle>
-              <p className="text-sm text-muted-foreground">A classificação controla o que entra em “Saídas pagas no mês”.</p>
+              <CardTitle>Recebedores e estabelecimentos</CardTitle>
+              <p className="text-sm text-muted-foreground">
+                A seleção desta tabela cria uma regra permanente. Ex.: VOLT 3D → Filamento. Uma exceção pontual pode ser feita na tabela de movimentações logo abaixo.
+              </p>
             </CardHeader>
-            <CardContent className="space-y-2 text-sm">
-              <div className="flex justify-between gap-4"><span>Gastos Freo Figures</span><b>{formatBRL(pluggyBusinessExpensesTotal.toFixed(2))}</b></div>
-              <div className="flex justify-between gap-4"><span>Retiradas pessoais</span><b>{formatBRL(pluggyPersonalTotal.toFixed(2))}</b></div>
-              <div className="flex justify-between gap-4"><span>Débitos para revisar</span><b>{pluggyReviewCount}</b></div>
-            </CardContent>
-          </Card>
-        ) : (
-          <Card>
-            <CardHeader><CardTitle>Saídas cadastradas e pagas</CardTitle></CardHeader>
             <CardContent className="overflow-x-auto p-0">
               <Table>
-                <THead><TR><TH>Data</TH><TH>Conta</TH><TH>Descrição</TH><TH>Valor</TH></TR></THead>
+                <THead>
+                  <TR><TH>Recebedor / estabelecimento</TH><TH>Origem</TH><TH>Movimentos</TH><TH>Total no mês</TH><TH>Categoria / regra permanente</TH></TR>
+                </THead>
                 <TBody>
-                  {loading ? <TR><TD colSpan={4}>Carregando saídas...</TD></TR> : registeredPaidExpenses.length === 0 ? (
-                    <TR><TD colSpan={4} className="text-muted-foreground">Nenhuma saída paga neste mês.</TD></TR>
-                  ) : registeredPaidExpenses.map((row: any) => {
-                    const account = accountOf(row);
-                    return <TR key={row.id}><TD>{formatDate(row.occurred_at)}</TD><TD>{account?.name ?? "—"}</TD><TD>{row.description || "—"}</TD><TD className="font-medium">{formatBRL(row.amount)}</TD></TR>;
+                  {pluggyLoading ? <TR><TD colSpan={5}>Carregando...</TD></TR> : receiverGroups.length === 0 ? (
+                    <TR><TD colSpan={5} className="text-muted-foreground">Nenhuma saída ou compra importada neste mês.</TD></TR>
+                  ) : receiverGroups.map((group) => {
+                    const sources = Array.from(new Set(group.rows.map(sourceLabel))).join(" / ");
+                    const firstDocument = group.rows.map(documentOf).find(Boolean);
+                    return (
+                      <TR key={group.key}>
+                        <TD>
+                          <div className="font-medium">{group.label}</div>
+                          {firstDocument ? <div className="text-xs text-muted-foreground">CPF/CNPJ: {firstDocument}</div> : null}
+                        </TD>
+                        <TD>{sources}</TD>
+                        <TD>{group.rows.length}</TD>
+                        <TD className="font-medium">{formatBRL(group.total.toFixed(2))}</TD>
+                        <TD>
+                          <ClassificationSelect
+                            value={groupValue(group)}
+                            categories={categories}
+                            disabled={savingKey === group.key}
+                            onChange={(value) => { void applyRule(group, value); }}
+                          />
+                          {group.rows.some((row) => row.classification_source === "manual") ? (
+                            <div className="mt-1 text-xs text-muted-foreground">Há exceção manual neste grupo.</div>
+                          ) : null}
+                        </TD>
+                      </TR>
+                    );
                   })}
                 </TBody>
               </Table>
             </CardContent>
           </Card>
-        )}
-      </div>
 
-      {pluggy.connected ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Movimentações Nubank PJ do mês</CardTitle>
-            <p className="text-sm text-muted-foreground">Pix para seu nome é marcado automaticamente como retirada pessoal. Você pode corrigir qualquer débito manualmente; a escolha é preservada nas próximas sincronizações.</p>
-          </CardHeader>
-          <CardContent className="overflow-x-auto p-0">
-            <Table>
-              <THead><TR><TH>Data</TH><TH>Descrição</TH><TH>Contraparte</TH><TH>Operação</TH><TH>Classificação</TH><TH>Valor</TH></TR></THead>
-              <TBody>
-                {pluggyLoading ? <TR><TD colSpan={6}>Carregando Nubank...</TD></TR> : pluggyTransactions.length === 0 ? (
-                  <TR><TD colSpan={6} className="text-muted-foreground">Nenhuma movimentação Nubank encontrada neste mês.</TD></TR>
-                ) : pluggyTransactions.map((row) => (
-                  <TR key={row.id}>
-                    <TD>{formatDate(row.occurred_on)}</TD>
-                    <TD>{row.description}</TD>
-                    <TD>{counterparty(row)}</TD>
-                    <TD>{row.payment_method || row.operation_type || row.transaction_type}{row.status !== "POSTED" ? ` · ${row.status}` : ""}</TD>
-                    <TD>
-                      {row.transaction_type === "DEBIT" ? (
-                        <select
-                          className="h-9 min-w-40 rounded-md border bg-background px-2 text-sm"
-                          value={row.classification}
-                          disabled={classificationSavingId === row.id || row.status !== "POSTED"}
-                          onChange={(event) => { void changeClassification(row.id, event.target.value as "business" | "personal" | "ignore" | "review"); }}
-                        >
-                          <option value="business">Gasto Freo Figures</option>
-                          <option value="personal">Retirada pessoal</option>
-                          <option value="ignore">Ignorar</option>
-                          <option value="review">Revisar</option>
-                        </select>
-                      ) : classificationLabel(row.classification)}
-                    </TD>
-                    <TD className="font-medium">{row.transaction_type === "DEBIT" ? "-" : "+"}{formatBRL(row.amount)}</TD>
-                  </TR>
+          {creditAccounts.length > 0 ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>Cartão(ões) Nubank PJ</CardTitle>
+                <p className="text-sm text-muted-foreground">Os valores abaixo são os campos devolvidos pela Pluggy para cada conta CREDIT; quando algum campo não vier do banco, o painel mostra “—” em vez de estimar.</p>
+              </CardHeader>
+              <CardContent className="overflow-x-auto p-0">
+                <Table>
+                  <THead><TR><TH>Cartão</TH><TH>Saldo/uso atual</TH><TH>Limite</TH><TH>Disponível</TH><TH>Fechamento</TH><TH>Vencimento</TH><TH>Mínimo</TH></TR></THead>
+                  <TBody>
+                    {creditAccounts.map((account) => (
+                      <TR key={account.pluggy_account_id}>
+                        <TD>{accountName(account)}</TD>
+                        <TD>{account.balance === null ? "—" : formatBRL(String(account.balance))}</TD>
+                        <TD>{account.credit_limit === null ? "—" : formatBRL(String(account.credit_limit))}</TD>
+                        <TD>{account.available_credit_limit === null ? "—" : formatBRL(String(account.available_credit_limit))}</TD>
+                        <TD>{account.balance_close_date ? formatDate(account.balance_close_date) : "—"}</TD>
+                        <TD>{account.balance_due_date ? formatDate(account.balance_due_date) : "—"}</TD>
+                        <TD>{account.minimum_payment === null ? "—" : formatBRL(String(account.minimum_payment))}</TD>
+                      </TR>
+                    ))}
+                  </TBody>
+                </Table>
+              </CardContent>
+            </Card>
+          ) : null}
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <Card>
+              <CardHeader><CardTitle>Gastos por categoria</CardTitle></CardHeader>
+              <CardContent className="space-y-2">
+                {categoryTotals.length === 0 ? <p className="text-sm text-muted-foreground">Nenhum gasto classificado no mês.</p> : categoryTotals.map((item) => (
+                  <div key={item.categoryId} className="flex items-center justify-between gap-4 border-b py-2 text-sm last:border-0">
+                    <span>{item.name}</span><b>{formatBRL(item.total.toFixed(2))}</b>
+                  </div>
                 ))}
-              </TBody>
-            </Table>
-          </CardContent>
-        </Card>
-      ) : null}
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Regra financeira</CardTitle></CardHeader>
+              <CardContent className="space-y-2 text-sm text-muted-foreground">
+                <p><b className="text-foreground">Compra no cartão:</b> entra nas métricas de gastos/categoria, mas não sai do caixa bancário naquele momento.</p>
+                <p><b className="text-foreground">Pagamento da fatura:</b> marque como “Pagamento de fatura”; sai do caixa, mas não duplica o gasto por categoria.</p>
+                <p><b className="text-foreground">Pix para sua conta pessoal:</b> fica como retirada pessoal e não entra em gasto empresarial.</p>
+                <p><b className="text-foreground">Transferência entre suas contas:</b> marque como transferência para não virar custo.</p>
+              </CardContent>
+            </Card>
+          </div>
 
-      {transferGroups.length > 0 ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>Movimentações importadas do Nubank</CardTitle>
+              <p className="text-sm text-muted-foreground">A coluna “Somente esta compra” cria uma exceção manual sem alterar a regra do estabelecimento.</p>
+            </CardHeader>
+            <CardContent className="overflow-x-auto p-0">
+              <Table>
+                <THead>
+                  <TR><TH>Data</TH><TH>Recebedor / estabelecimento</TH><TH>Conta</TH><TH>Forma</TH><TH>Parcela</TH><TH>Valor</TH><TH>Classificação atual</TH><TH>Somente esta compra</TH></TR>
+                </THead>
+                <TBody>
+                  {pluggyLoading ? <TR><TD colSpan={8}>Carregando...</TD></TR> : classifiableRows.length === 0 ? (
+                    <TR><TD colSpan={8} className="text-muted-foreground">Nenhuma compra/saída reconhecida neste mês.</TD></TR>
+                  ) : classifiableRows.map((row) => (
+                    <TR key={row.id}>
+                      <TD>{formatDate(row.occurred_on)}</TD>
+                      <TD>
+                        <div className="font-medium">{counterparty(row)}</div>
+                        <div className="max-w-80 truncate text-xs text-muted-foreground" title={row.description}>{row.description}</div>
+                      </TD>
+                      <TD>{accountName(accountMap.get(row.pluggy_account_id))}</TD>
+                      <TD>{sourceLabel(row)}{row.status !== "POSTED" ? ` · ${row.status}` : ""}</TD>
+                      <TD>
+                        <div>{installmentLabel(row)}</div>
+                        {row.total_amount ? <div className="text-xs text-muted-foreground">Total compra: {formatBRL(String(row.total_amount))}</div> : null}
+                        {row.bill_forecast_date ? <div className="text-xs text-muted-foreground">Fatura prevista: {row.bill_forecast_date}</div> : null}
+                      </TD>
+                      <TD className="font-medium">{formatBRL(String(row.amount))}</TD>
+                      <TD>
+                        <div>{classificationLabel(row, categoryMap)}</div>
+                        <div className="text-xs text-muted-foreground">{row.classification_source === "rule" ? "regra" : row.classification_source === "manual" ? "exceção manual" : "automático"}</div>
+                      </TD>
+                      <TD>
+                        <ClassificationSelect
+                          value={optionValue(row)}
+                          categories={categories}
+                          disabled={savingRowId === row.id}
+                          onChange={(value) => { void applyOne(row, value); }}
+                        />
+                      </TD>
+                    </TR>
+                  ))}
+                </TBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </>
+      ) : (
         <Card>
-          <CardHeader>
-            <CardTitle>Saques e transferências Shopee — informativo</CardTitle>
-            <p className="text-sm text-muted-foreground">Estes valores apenas mudaram de conta. Não entram em “Entradas Shopee” nem em “Saídas pagas”.</p>
-          </CardHeader>
-          <CardContent className="overflow-x-auto p-0">
-            <Table>
-              <THead><TR><TH>Data</TH><TH>De</TH><TH>Para</TH><TH>Movimento</TH><TH>Valor</TH></TR></THead>
-              <TBody>{transferGroups.map((row) => <TR key={row.key}><TD>{formatDate(row.date)}</TD><TD>{row.from}</TD><TD>{row.to}</TD><TD>{row.description}</TD><TD className="font-medium">{formatBRL(row.amount)}</TD></TR>)}</TBody>
-            </Table>
+          <CardContent className="pt-5 text-sm text-muted-foreground">
+            Nubank/Pluggy ainda não está vinculada. Enquanto isso, o cadastro manual abaixo continua funcionando normalmente.
           </CardContent>
         </Card>
-      ) : null}
+      )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Cadastro manual</CardTitle>
+          <p className="text-sm text-muted-foreground">Use para gastos que não passam pela conta/cartão sincronizados, evitando cadastrar manualmente uma compra que já veio da Pluggy.</p>
+        </CardHeader>
+        <CardContent><CashEntryForm type="expense" month={month} onDone={refreshManual} /></CardContent>
+      </Card>
+
+      {manualError ? <p className="text-sm text-destructive">{manualError}</p> : null}
+
+      <Card>
+        <CardHeader><CardTitle>Compras cadastradas manualmente</CardTitle></CardHeader>
+        <CardContent className="overflow-x-auto p-0">
+          <Table>
+            <THead>
+              <TR>
+                <TH>Data da compra</TH><TH>Categoria</TH><TH>Descrição</TH><TH>Forma</TH><TH>Valor total</TH><TH>Parcelamento</TH><TH>Efeito imediato no caixa</TH>
+                {columns.map((column) => <TH key={column.id}>{column.label}</TH>)}<TH>Ações</TH>
+              </TR>
+            </THead>
+            <TBody>
+              {manualLoading ? <TR><TD colSpan={8 + columns.length}>Carregando...</TD></TR> : expenses.length === 0 ? (
+                <TR><TD colSpan={8 + columns.length} className="text-muted-foreground">Nenhuma compra manual neste mês.</TD></TR>
+              ) : expenses.map((entry: any) => {
+                const deferred = entry.payment_method === "credit" || entry.payment_method === "installment";
+                return (
+                  <TR key={entry.id}>
+                    <TD>{new Date(`${entry.spent_at}T12:00:00`).toLocaleDateString("pt-BR")}</TD>
+                    <TD>{entry.categories?.name ?? "—"}</TD>
+                    <TD>{entry.description}</TD>
+                    <TD>{PAYMENT_METHOD_LABELS[entry.payment_method] ?? "Não informado"}</TD>
+                    <TD>{formatBRL(entry.amount)}</TD>
+                    <TD>{deferred ? `${entry.installment_count ?? 1}x · 1º venc. ${entry.first_due_date ? new Date(`${entry.first_due_date}T12:00:00`).toLocaleDateString("pt-BR") : "—"}` : "À vista"}</TD>
+                    <TD>{deferred ? "Nenhum até a baixa" : formatBRL(entry.amount)}</TD>
+                    {columns.map((column) => <TD key={column.id}>{String(entry.custom_fields?.[column.key] ?? "—")}</TD>)}
+                    <TD><EntryActions type="expense" entry={entry} onDone={refreshManual} /></TD>
+                  </TR>
+                );
+              })}
+            </TBody>
+          </Table>
+        </CardContent>
+      </Card>
     </div>
   );
 }
