@@ -5,6 +5,32 @@ import { decryptSecret } from "@/lib/crypto";
 const PLUGGY_API = "https://api.pluggy.ai";
 const MAX_TRANSACTION_PAGES = 200;
 
+type PluggyCredentials = {
+  clientId: string;
+  clientSecret: string;
+};
+
+type PluggySettingsRow = {
+  pluggy_credentials_ciphertext: string | null;
+  pluggy_item_id: string | null;
+  pluggy_account_id: string | null;
+  pluggy_personal_receiver_name: string | null;
+  pluggy_last_sync_at: string | null;
+};
+
+type JsonRecord = Record<string, unknown>;
+type SpendClassification = "business" | "personal" | "transfer" | "card_payment" | "credit" | "ignore" | "review";
+
+type ExistingManual = {
+  classification: SpendClassification;
+  categoryId: string | null;
+};
+
+type SpendRule = {
+  classification: Exclude<SpendClassification, "credit">;
+  categoryId: string | null;
+};
+
 function appSecretKey(): Buffer {
   const raw = process.env.APP_ENCRYPTION_KEY_BASE64?.trim() ?? "";
   const key = Buffer.from(raw, "base64");
@@ -33,21 +59,6 @@ export function verifyPluggyWebhookSignature(userId: string, signature: string):
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-type PluggyCredentials = {
-  clientId: string;
-  clientSecret: string;
-};
-
-type PluggySettingsRow = {
-  pluggy_credentials_ciphertext: string | null;
-  pluggy_item_id: string | null;
-  pluggy_account_id: string | null;
-  pluggy_personal_receiver_name: string | null;
-  pluggy_last_sync_at: string | null;
-};
-
-type JsonRecord = Record<string, unknown>;
-
 function object(value: unknown): JsonRecord | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : null;
 }
@@ -63,6 +74,20 @@ function numberOrNull(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
+}
+
+function integerOrNull(value: unknown): number | null {
+  const n = numberOrNull(value);
+  return n !== null && Number.isInteger(n) ? n : null;
+}
+
+function roundMoney(value: unknown): number {
+  const n = numberOrNull(value) ?? 0;
+  return Math.round(n * 100) / 100;
+}
+
+function absMoney(value: unknown): number {
+  return Math.abs(roundMoney(value));
 }
 
 function describeApiError(body: unknown, status: number): string {
@@ -136,10 +161,7 @@ export async function readPluggySettings(userId: string) {
     .single();
   if (error) throw new Error(`[Pluggy/configuração] ${error.message}`);
   const row = data as PluggySettingsRow;
-  return {
-    ...row,
-    credentials: parseCredentials(row.pluggy_credentials_ciphertext),
-  };
+  return { ...row, credentials: parseCredentials(row.pluggy_credentials_ciphertext) };
 }
 
 export async function validatePluggyCredentials(clientId: string, clientSecret: string): Promise<void> {
@@ -170,24 +192,22 @@ export async function createPluggyConnectTokenForUser(userId: string, itemId?: s
   const settings = await readPluggySettings(userId);
   if (!settings.credentials) throw new Error("Configure primeiro o Client ID e o Client Secret da Pluggy.");
   const apiKey = await createPluggyApiKey(settings.credentials);
-
   const cleanItemId = string(itemId ?? settings.pluggy_item_id);
+  const webhookUrl = buildPluggyWebhookUrl(userId);
   const payload: JsonRecord = {
     options: {
       clientUserId: userId,
       avoidDuplicates: true,
-      ...(buildPluggyWebhookUrl(userId) ? { webhookUrl: buildPluggyWebhookUrl(userId) } : {}),
+      ...(webhookUrl ? { webhookUrl } : {}),
     },
   };
   if (cleanItemId) payload.itemId = cleanItemId;
-
   const tokenBody = await pluggyRequest(apiKey, "/connect_token", {
     method: "POST",
     body: JSON.stringify(payload),
   });
   const accessToken = string(tokenBody.accessToken) || string(tokenBody.connectToken);
   if (!accessToken) throw new Error("A Pluggy não retornou o Connect Token esperado.");
-
   return {
     accessToken,
     itemId: cleanItemId || null,
@@ -201,10 +221,7 @@ export async function rememberPluggyItemFromWebhook(userId: string, itemId: stri
   const admin = createAdminClient();
   const update: Record<string, unknown> = { pluggy_item_id: cleanItemId };
   if (connected) update.pluggy_connected_at = new Date().toISOString();
-  const { error } = await admin
-    .from("integration_settings")
-    .update(update)
-    .eq("user_id", userId);
+  const { error } = await admin.from("integration_settings").update(update).eq("user_id", userId);
   if (error) throw new Error(`[Pluggy/webhook] ${error.message}`);
 }
 
@@ -213,24 +230,17 @@ export async function registerPluggyItem(userId: string, itemId: string): Promis
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanItemId)) {
     throw new Error("Item ID da Pluggy inválido.");
   }
-
   const settings = await readPluggySettings(userId);
   if (!settings.credentials) throw new Error("Credenciais Pluggy não configuradas.");
   const apiKey = await createPluggyApiKey(settings.credentials);
   const item = await pluggyRequest(apiKey, `/items/${encodeURIComponent(cleanItemId)}`);
   const clientUserId = string(item.clientUserId);
-  if (clientUserId && clientUserId !== userId) {
-    throw new Error("Este Item da Pluggy pertence a outro usuário do painel.");
-  }
-
+  if (clientUserId && clientUserId !== userId) throw new Error("Este Item da Pluggy pertence a outro usuário do painel.");
   const admin = createAdminClient();
-  const { error } = await admin
-    .from("integration_settings")
-    .update({
-      pluggy_item_id: cleanItemId,
-      pluggy_connected_at: new Date().toISOString(),
-    })
-    .eq("user_id", userId);
+  const { error } = await admin.from("integration_settings").update({
+    pluggy_item_id: cleanItemId,
+    pluggy_connected_at: new Date().toISOString(),
+  }).eq("user_id", userId);
   if (error) throw new Error(`[Pluggy/salvar Item] ${error.message}`);
 }
 
@@ -258,11 +268,120 @@ function normalizeName(value: unknown): string {
     .replace(/\s+/g, " ");
 }
 
-export function classifyPluggyTransaction(transaction: JsonRecord, personalReceiverName: string) {
-  const type = string(transaction.type).toUpperCase();
+function canonicalCardDescription(value: unknown): string {
+  return normalizeName(value)
+    .replace(/\bPARC(?:ELA)?\s*\d{1,2}\s*(?:DE|\/|-)\s*\d{1,2}\b/g, " ")
+    .replace(/\b\d{1,2}\s*(?:\/|-)\s*\d{1,2}\b/g, " ")
+    .replace(/\b\d{1,2}\s+DE\s+\d{1,2}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function taxDigits(value: unknown): string {
+  return string(value).replace(/\D/g, "");
+}
+
+function participantDocument(participant: JsonRecord | null): string {
+  const document = object(participant?.documentNumber);
+  return taxDigits(document?.value);
+}
+
+function accountTypeOf(account: JsonRecord): "BANK" | "CREDIT" | "" {
+  const type = string(account.type).toUpperCase();
+  return type === "BANK" || type === "CREDIT" ? type : "";
+}
+
+function transactionIdentity(transaction: JsonRecord, accountType: "BANK" | "CREDIT") {
+  const paymentData = object(transaction.paymentData);
+  const payer = object(paymentData?.payer);
+  const receiver = object(paymentData?.receiver);
+  const merchant = object(transaction.merchant);
+  const payerName = string(payer?.name);
+  const receiverName = string(receiver?.name);
+  const payerDocument = participantDocument(payer);
+  const receiverDocument = participantDocument(receiver);
+  const merchantName = string(merchant?.name);
+  const merchantBusinessName = string(merchant?.businessName);
+  const merchantCnpj = taxDigits(merchant?.cnpj);
+  const description = string(transaction.description) || "Movimentação bancária";
+
+  let matchKey = "";
+  let matchLabel = "";
+
+  if (accountType === "CREDIT") {
+    if (merchantCnpj) {
+      matchKey = `merchant-doc:${merchantCnpj}`;
+      matchLabel = merchantName || merchantBusinessName || description;
+    } else if (merchantName || merchantBusinessName) {
+      const label = merchantName || merchantBusinessName;
+      matchKey = `merchant:${normalizeName(label)}`;
+      matchLabel = label;
+    } else {
+      const canonical = canonicalCardDescription(description);
+      matchKey = `card-desc:${canonical || normalizeName(description)}`;
+      matchLabel = canonical || description;
+    }
+  } else {
+    const type = string(transaction.type).toUpperCase();
+    if (type === "DEBIT") {
+      if (receiverDocument) {
+        matchKey = `receiver-doc:${receiverDocument}`;
+        matchLabel = receiverName || description;
+      } else if (receiverName) {
+        matchKey = `receiver:${normalizeName(receiverName)}`;
+        matchLabel = receiverName;
+      } else {
+        matchKey = `bank-desc:${normalizeName(description)}`;
+        matchLabel = description;
+      }
+    } else {
+      if (payerDocument) {
+        matchKey = `payer-doc:${payerDocument}`;
+        matchLabel = payerName || description;
+      } else if (payerName) {
+        matchKey = `payer:${normalizeName(payerName)}`;
+        matchLabel = payerName;
+      } else {
+        matchKey = `bank-credit:${normalizeName(description)}`;
+        matchLabel = description;
+      }
+    }
+  }
+
+  return {
+    payerName: payerName || null,
+    receiverName: receiverName || null,
+    payerDocument: payerDocument || null,
+    receiverDocument: receiverDocument || null,
+    merchantName: merchantName || null,
+    merchantBusinessName: merchantBusinessName || null,
+    merchantCnpj: merchantCnpj || null,
+    matchKey,
+    matchLabel: matchLabel || description,
+  };
+}
+
+/**
+ * Classificação automática deliberadamente conservadora:
+ * - créditos nunca viram gasto;
+ * - PIX para o nome pessoal configurado vira retirada pessoal;
+ * - qualquer outro débito/compra novo fica REVIEW até existir regra criada pelo usuário.
+ */
+export function classifyPluggyTransaction(
+  transaction: JsonRecord,
+  personalReceiverName: string,
+  accountType: "BANK" | "CREDIT" = "BANK",
+): SpendClassification {
   const status = string(transaction.status).toUpperCase();
-  if (type === "CREDIT") return "credit" as const;
-  if (type !== "DEBIT" || status !== "POSTED") return "review" as const;
+  const type = string(transaction.type).toUpperCase();
+  const signedAmount = roundMoney(transaction.amount);
+
+  if (accountType === "CREDIT") {
+    return signedAmount > 0 ? "review" : "credit";
+  }
+
+  if (type === "CREDIT") return "credit";
+  if (type !== "DEBIT" || status !== "POSTED") return "review";
 
   const paymentData = object(transaction.paymentData);
   const receiver = object(paymentData?.receiver);
@@ -272,34 +391,26 @@ export function classifyPluggyTransaction(transaction: JsonRecord, personalRecei
   const paymentMethod = string(paymentData?.paymentMethod).toUpperCase();
   const operationType = string(transaction.operationType).toUpperCase();
   const isPix = paymentMethod === "PIX" || operationType === "PIX" || /(^| )PIX( |$)/.test(description);
-  const receiverMatches = Boolean(target) && (
-    receiverName
-      ? receiverName === target || receiverName.includes(target)
-      : description.includes(target)
-  );
-
-  if (isPix && receiverMatches) return "personal" as const;
-  if (isPix && !receiverName) return "review" as const;
-  return "business" as const;
+  const receiverMatches = Boolean(target) && (receiverName ? receiverName === target || receiverName.includes(target) : description.includes(target));
+  if (isPix && receiverMatches) return "personal";
+  return "review";
 }
 
-async function listBankAccounts(apiKey: string, itemId: string): Promise<JsonRecord[]> {
-  const query = new URLSearchParams({ itemId, type: "BANK" });
+async function listFinancialAccounts(apiKey: string, itemId: string): Promise<JsonRecord[]> {
+  const query = new URLSearchParams({ itemId });
   const body = await pluggyRequest(apiKey, `/accounts?${query.toString()}`);
-  return arrayFromList(body).filter((account) => string(account.type).toUpperCase() === "BANK");
+  return arrayFromList(body).filter((account) => Boolean(accountTypeOf(account)));
 }
 
 async function listAllTransactions(apiKey: string, accountId: string): Promise<JsonRecord[]> {
   const transactions: JsonRecord[] = [];
   let path = `/v2/transactions?${new URLSearchParams({ accountId }).toString()}`;
-
   for (let page = 0; page < MAX_TRANSACTION_PAGES; page += 1) {
     const body = await pluggyRequest(apiKey, path);
     const results = Array.isArray(body.results)
       ? body.results.filter((item): item is JsonRecord => Boolean(object(item)))
       : [];
     transactions.push(...results);
-
     const next = string(body.next);
     if (!next) return transactions;
     if (next.startsWith("?")) path = `/v2/transactions${next}`;
@@ -307,22 +418,18 @@ async function listAllTransactions(apiKey: string, accountId: string): Promise<J
     else if (next.startsWith("https://api.pluggy.ai/")) path = next;
     else throw new Error("A Pluggy retornou um cursor de paginação inválido.");
   }
-
   throw new Error(`A paginação da Pluggy ultrapassou ${MAX_TRANSACTION_PAGES} páginas; sincronização interrompida para evitar loop.`);
 }
 
-function cleanMoney(value: unknown): number {
-  const parsed = numberOrNull(value);
-  if (parsed === null) return 0;
-  return Math.round(Math.abs(parsed) * 100) / 100;
-}
-
-function taxDigits(value: unknown): string {
-  return string(value).replace(/\D/g, "");
+function dateOrNull(value: unknown): string | null {
+  const raw = string(value);
+  return /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : null;
 }
 
 export type PluggyPullResult = {
   accounts: number;
+  bankAccounts: number;
+  creditAccounts: number;
   transactions: number;
   selectedAccountId: string | null;
   selectedAccountName: string | null;
@@ -346,45 +453,61 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     throw new Error(`A conexão Pluggy precisa ser autorizada novamente (${executionStatus || "LOGIN_ERROR"}).`);
   }
 
-  const accounts = await listBankAccounts(apiKey, itemId);
+  const accounts = await listFinancialAccounts(apiKey, itemId);
+  const bankAccounts = accounts.filter((account) => accountTypeOf(account) === "BANK");
+  const creditAccounts = accounts.filter((account) => accountTypeOf(account) === "CREDIT");
   if (accounts.length === 0) {
-    throw new Error("O Item do Meu Pluggy não retornou nenhuma conta bancária. Confirme que a conta Nubank PJ foi autorizada no Meu Pluggy.");
+    throw new Error("O Item do Meu Pluggy não retornou conta bancária nem cartão. Confirme a autorização da Nubank PJ no Meu Pluggy.");
   }
 
   const admin = createAdminClient();
   const syncAt = new Date().toISOString();
 
-  const accountRows = accounts.map((account) => ({
-    user_id: userId,
-    pluggy_account_id: string(account.id),
-    pluggy_item_id: itemId,
-    type: string(account.type) || "BANK",
-    subtype: string(account.subtype) || null,
-    name: string(account.name) || "Conta bancária",
-    marketing_name: string(account.marketingName) || null,
-    number_masked: string(account.number) || null,
-    owner_name: string(account.owner) || null,
-    balance: numberOrNull(account.balance),
-    currency_code: string(account.currencyCode) || "BRL",
-    synced_at: syncAt,
-  })).filter((row) => row.pluggy_account_id);
+  const accountRows = accounts.map((account) => {
+    const accountType = accountTypeOf(account);
+    const creditData = object(account.creditData);
+    return {
+      user_id: userId,
+      pluggy_account_id: string(account.id),
+      pluggy_item_id: itemId,
+      type: accountType,
+      subtype: string(account.subtype) || null,
+      name: string(account.name) || (accountType === "CREDIT" ? "Cartão de crédito" : "Conta bancária"),
+      marketing_name: string(account.marketingName) || null,
+      number_masked: string(account.number) || null,
+      owner_name: string(account.owner) || null,
+      tax_number: taxDigits(account.taxNumber) || null,
+      balance: numberOrNull(account.balance),
+      currency_code: string(account.currencyCode) || "BRL",
+      credit_limit: numberOrNull(creditData?.creditLimit),
+      available_credit_limit: numberOrNull(creditData?.availableCreditLimit),
+      balance_close_date: dateOrNull(creditData?.balanceCloseDate),
+      balance_due_date: dateOrNull(creditData?.balanceDueDate),
+      minimum_payment: numberOrNull(creditData?.minimumPayment),
+      synced_at: syncAt,
+    };
+  }).filter((row) => row.pluggy_account_id && row.type);
 
-  const { error: deleteAccountsError } = await admin
+  if (accountRows.length) {
+    const { error: accountUpsertError } = await admin
+      .from("pluggy_bank_accounts")
+      .upsert(accountRows, { onConflict: "user_id,pluggy_account_id" });
+    if (accountUpsertError) throw new Error(`[Pluggy/contas] ${accountUpsertError.message}`);
+  }
+  const { error: pruneAccountError } = await admin
     .from("pluggy_bank_accounts")
     .delete()
     .eq("user_id", userId)
-    .eq("pluggy_item_id", itemId);
-  if (deleteAccountsError) throw new Error(`[Pluggy/contas] ${deleteAccountsError.message}`);
-
-  const { error: accountInsertError } = await admin.from("pluggy_bank_accounts").insert(accountRows);
-  if (accountInsertError) throw new Error(`[Pluggy/contas] ${accountInsertError.message}`);
+    .eq("pluggy_item_id", itemId)
+    .lt("synced_at", syncAt);
+  if (pruneAccountError) throw new Error(`[Pluggy/contas antigas] ${pruneAccountError.message}`);
 
   const currentSelected = string(settings.pluggy_account_id);
-  const currentExists = accounts.some((account) => string(account.id) === currentSelected);
-  const cnpjAccounts = accounts.filter((account) => taxDigits(account.taxNumber).length === 14);
+  const currentExists = bankAccounts.some((account) => string(account.id) === currentSelected);
+  const cnpjBankAccounts = bankAccounts.filter((account) => taxDigits(account.taxNumber).length === 14);
   let selectedAccountId = currentExists ? currentSelected : "";
-  if (!selectedAccountId && accounts.length === 1) selectedAccountId = string(accounts[0]?.id);
-  if (!selectedAccountId && cnpjAccounts.length === 1) selectedAccountId = string(cnpjAccounts[0]?.id);
+  if (!selectedAccountId && bankAccounts.length === 1) selectedAccountId = string(bankAccounts[0]?.id);
+  if (!selectedAccountId && cnpjBankAccounts.length === 1) selectedAccountId = string(cnpjBankAccounts[0]?.id);
 
   if (selectedAccountId !== currentSelected) {
     const { error: selectError } = await admin
@@ -394,70 +517,131 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     if (selectError) throw new Error(`[Pluggy/seleção da conta] ${selectError.message}`);
   }
 
+  const { data: rulesData, error: rulesError } = await admin
+    .from("pluggy_spend_rules")
+    .select("match_key,classification,category_id")
+    .eq("user_id", userId);
+  if (rulesError) throw new Error(`[Pluggy/regras] ${rulesError.message}. Confirme que a migration 011 foi executada.`);
+  const rules = new Map<string, SpendRule>();
+  for (const row of rulesData ?? []) {
+    const key = String(row.match_key ?? "");
+    const classification = String(row.classification ?? "review") as SpendRule["classification"];
+    if (key) rules.set(key, { classification, categoryId: row.category_id ? String(row.category_id) : null });
+  }
+
   const personalReceiverName = string(settings.pluggy_personal_receiver_name) || "KEVYN APARECIDO FREO";
   let transactionCount = 0;
 
   for (const account of accounts) {
     const accountId = string(account.id);
-    if (!accountId) continue;
+    const accountType = accountTypeOf(account);
+    if (!accountId || !accountType) continue;
 
-    const { data: existingManual, error: manualError } = await admin
+    const { data: existingManualData, error: manualError } = await admin
       .from("pluggy_bank_transactions")
-      .select("pluggy_transaction_id,classification,classification_source")
+      .select("pluggy_transaction_id,classification,category_id,classification_source")
       .eq("user_id", userId)
       .eq("pluggy_account_id", accountId)
       .eq("classification_source", "manual");
-    if (manualError) throw new Error(`[Pluggy/classificações] ${manualError.message}`);
-    const manualMap = new Map((existingManual ?? []).map((row: any) => [String(row.pluggy_transaction_id), String(row.classification)]));
+    if (manualError) throw new Error(`[Pluggy/classificações manuais] ${manualError.message}`);
+    const manualMap = new Map<string, ExistingManual>();
+    for (const row of existingManualData ?? []) {
+      const id = String(row.pluggy_transaction_id ?? "");
+      if (!id) continue;
+      manualMap.set(id, {
+        classification: String(row.classification ?? "review") as SpendClassification,
+        categoryId: row.category_id ? String(row.category_id) : null,
+      });
+    }
 
     const remoteTransactions = await listAllTransactions(apiKey, accountId);
     const rows = remoteTransactions.map((transaction) => {
       const transactionId = string(transaction.id);
-      const paymentData = object(transaction.paymentData);
-      const payer = object(paymentData?.payer);
-      const receiver = object(paymentData?.receiver);
-      const automatic = classifyPluggyTransaction(transaction, personalReceiverName);
-      const manual = manualMap.get(transactionId);
-      const classification = manual || automatic;
-      const classificationSource = manual ? "manual" : "auto";
       const date = string(transaction.date);
+      if (!transactionId || !date) return null;
+
+      const identity = transactionIdentity(transaction, accountType);
+      const automatic = classifyPluggyTransaction(transaction, personalReceiverName, accountType);
+      const manual = manualMap.get(transactionId);
+      const rule = identity.matchKey ? rules.get(identity.matchKey) : undefined;
+
+      let classification: SpendClassification;
+      let categoryId: string | null = null;
+      let classificationSource: "auto" | "rule" | "manual" = "auto";
+
+      if (automatic === "personal") {
+        classification = "personal";
+      } else if (manual) {
+        classification = manual.classification;
+        categoryId = classification === "business" ? manual.categoryId : null;
+        classificationSource = "manual";
+      } else if (rule && automatic !== "credit") {
+        classification = rule.classification;
+        categoryId = classification === "business" ? rule.categoryId : null;
+        classificationSource = "rule";
+      } else {
+        classification = automatic;
+      }
+
+      const paymentData = object(transaction.paymentData);
+      const creditCardMetadata = object(transaction.creditCardMetadata);
+      const originalAmount = roundMoney(transaction.amount);
       return {
         user_id: userId,
         pluggy_transaction_id: transactionId,
         pluggy_account_id: accountId,
         pluggy_item_id: itemId,
+        account_type: accountType,
         occurred_at: date,
         occurred_on: saoPauloDate(date),
         description: string(transaction.description) || "Movimentação bancária",
         description_raw: string(transaction.descriptionRaw) || null,
-        amount: cleanMoney(transaction.amount),
-        transaction_type: string(transaction.type).toUpperCase(),
-        status: string(transaction.status).toUpperCase(),
+        amount: absMoney(originalAmount),
+        signed_amount: originalAmount,
+        transaction_type: string(transaction.type).toUpperCase() === "DEBIT" ? "DEBIT" : "CREDIT",
+        status: string(transaction.status).toUpperCase() || "POSTED",
         operation_type: string(transaction.operationType).toUpperCase() || null,
         payment_method: string(paymentData?.paymentMethod).toUpperCase() || null,
-        payer_name: string(payer?.name) || null,
-        receiver_name: string(receiver?.name) || null,
+        payer_name: identity.payerName,
+        receiver_name: identity.receiverName,
+        payer_document: identity.payerDocument,
+        receiver_document: identity.receiverDocument,
+        merchant_name: identity.merchantName,
+        merchant_business_name: identity.merchantBusinessName,
+        merchant_cnpj: identity.merchantCnpj,
+        match_key: identity.matchKey || null,
+        match_label: identity.matchLabel || null,
         provider_id: string(transaction.providerId) || null,
         provider_code: string(transaction.providerCode) || null,
         classification,
         classification_source: classificationSource,
+        category_id: categoryId,
+        installment_number: integerOrNull(creditCardMetadata?.installmentNumber),
+        total_installments: integerOrNull(creditCardMetadata?.totalInstallments),
+        total_amount: numberOrNull(creditCardMetadata?.totalAmount) !== null ? absMoney(creditCardMetadata?.totalAmount) : null,
+        bill_id: string(creditCardMetadata?.billId) || null,
+        bill_forecast_date: string(creditCardMetadata?.billForecastDate) || null,
         synced_at: syncAt,
       };
-    }).filter((row) => row.pluggy_transaction_id && row.occurred_at && (row.transaction_type === "DEBIT" || row.transaction_type === "CREDIT"));
-
-    const { error: deleteTxError } = await admin
-      .from("pluggy_bank_transactions")
-      .delete()
-      .eq("user_id", userId)
-      .eq("pluggy_account_id", accountId);
-    if (deleteTxError) throw new Error(`[Pluggy/transações] ${deleteTxError.message}`);
+    }).filter((row): row is NonNullable<typeof row> => Boolean(row));
 
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
-      if (chunk.length === 0) continue;
-      const { error: insertTxError } = await admin.from("pluggy_bank_transactions").insert(chunk);
-      if (insertTxError) throw new Error(`[Pluggy/transações] ${insertTxError.message}`);
+      const { error: upsertError } = await admin
+        .from("pluggy_bank_transactions")
+        .upsert(chunk, { onConflict: "user_id,pluggy_transaction_id" });
+      if (upsertError) throw new Error(`[Pluggy/transações] ${upsertError.message}`);
     }
+
+    // Só remove registros antigos depois de todos os upserts terem sido concluídos.
+    const { error: pruneTxError } = await admin
+      .from("pluggy_bank_transactions")
+      .delete()
+      .eq("user_id", userId)
+      .eq("pluggy_account_id", accountId)
+      .lt("synced_at", syncAt);
+    if (pruneTxError) throw new Error(`[Pluggy/transações antigas] ${pruneTxError.message}`);
+
     transactionCount += rows.length;
   }
 
@@ -467,17 +651,34 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     .eq("user_id", userId);
   if (syncSettingsError) throw new Error(`[Pluggy/finalização] ${syncSettingsError.message}`);
 
-  const selectedAccount = accounts.find((account) => string(account.id) === selectedAccountId) ?? null;
+  const selectedAccount = bankAccounts.find((account) => string(account.id) === selectedAccountId) ?? null;
   return {
     accounts: accounts.length,
+    bankAccounts: bankAccounts.length,
+    creditAccounts: creditAccounts.length,
     transactions: transactionCount,
     selectedAccountId: selectedAccountId || null,
     selectedAccountName: selectedAccount ? (string(selectedAccount.marketingName) || string(selectedAccount.name) || "Conta bancária") : null,
     selectedBalance: selectedAccount ? numberOrNull(selectedAccount.balance) : null,
-    needsAccountSelection: !selectedAccountId && accounts.length > 1,
+    needsAccountSelection: !selectedAccountId && bankAccounts.length > 1,
     itemStatus,
     executionStatus,
   };
+}
+
+export async function deletePluggyTransactionsByIds(userId: string, transactionIds: string[]): Promise<void> {
+  const ids = transactionIds.map((id) => id.trim()).filter(Boolean);
+  if (!ids.length) return;
+  const admin = createAdminClient();
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    const { error } = await admin
+      .from("pluggy_bank_transactions")
+      .delete()
+      .eq("user_id", userId)
+      .in("pluggy_transaction_id", chunk);
+    if (error) throw new Error(`[Pluggy/excluir transações] ${error.message}`);
+  }
 }
 
 export async function revokePluggyItemAndClear(userId: string): Promise<void> {
@@ -498,14 +699,13 @@ export async function revokePluggyItemAndClear(userId: string): Promise<void> {
   if (txError) throw new Error(`[Pluggy/remover transações] ${txError.message}`);
   const { error: accountError } = await admin.from("pluggy_bank_accounts").delete().eq("user_id", userId);
   if (accountError) throw new Error(`[Pluggy/remover contas] ${accountError.message}`);
-  const { error: settingsError } = await admin
-    .from("integration_settings")
-    .update({
-      pluggy_item_id: null,
-      pluggy_account_id: null,
-      pluggy_connected_at: null,
-      pluggy_last_sync_at: null,
-    })
-    .eq("user_id", userId);
+  const { error: rulesError } = await admin.from("pluggy_spend_rules").delete().eq("user_id", userId);
+  if (rulesError && !/does not exist|schema cache/i.test(rulesError.message)) throw new Error(`[Pluggy/remover regras] ${rulesError.message}`);
+  const { error: settingsError } = await admin.from("integration_settings").update({
+    pluggy_item_id: null,
+    pluggy_account_id: null,
+    pluggy_connected_at: null,
+    pluggy_last_sync_at: null,
+  }).eq("user_id", userId);
   if (settingsError) throw new Error(`[Pluggy/remover integração] ${settingsError.message}`);
 }
