@@ -109,7 +109,7 @@ export function PluggyConnectButton({
         connectToken: accessToken,
         includeSandbox: false,
         language: "pt",
-        products: ["ACCOUNTS", "TRANSACTIONS"],
+        products: ["ACCOUNTS", "CREDIT_CARDS", "TRANSACTIONS"],
         allowConnectInBackground: false,
         onEvent: (event: unknown) => {
           const row = event && typeof event === "object" ? event as { item?: unknown } : null;
