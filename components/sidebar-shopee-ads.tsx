@@ -3,7 +3,18 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { LayoutDashboard, ShoppingCart, Wallet, CalendarClock, CalendarRange, Boxes, ReceiptText, Settings, Sparkles } from "lucide-react";
+import {
+  LayoutDashboard,
+  ShoppingCart,
+  Wallet,
+  CalendarClock,
+  CalendarRange,
+  Boxes,
+  ReceiptText,
+  Settings,
+  Sparkles,
+  Target,
+} from "lucide-react";
 
 const items = [
   ["/dashboard", "Dashboard", LayoutDashboard],
@@ -13,6 +24,7 @@ const items = [
   ["/resumo", "Resumo Mensal", CalendarRange],
   ["/produtos", "Produtos e Variações", Boxes],
   ["/compras", "Compras e Investimentos", ReceiptText],
+  ["/shopee-ads", "Shopee Ads", Target],
   ["/analise-ia", "Análise com IA", Sparkles],
   ["/configuracoes", "Configurações", Settings],
 ] as const;
@@ -29,7 +41,14 @@ export function Sidebar() {
       </div>
       <nav className="space-y-1 p-3">
         {items.map(([href, label, Icon]) => (
-          <Link key={href} href={href} className={cn("flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm", pathname === href ? "bg-primary text-primary-foreground" : "hover:bg-muted")}>
+          <Link
+            key={href}
+            href={href}
+            className={cn(
+              "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm",
+              pathname === href ? "bg-primary text-primary-foreground" : "hover:bg-muted",
+            )}
+          >
             <Icon size={17} />{label}
           </Link>
         ))}
