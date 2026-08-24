@@ -161,6 +161,7 @@ export default function ShopeeAdsPage() {
   const [savingWebhook, setSavingWebhook] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState("");
+  const [showAllProducts, setShowAllProducts] = useState(false);
 
   const period = useMemo(() => {
     if (granularity === "day") return { from: selectedDate, to: selectedDate };
@@ -221,7 +222,10 @@ export default function ShopeeAdsPage() {
     setMonthlyHistory((data ?? []) as AdsMetric[]);
   }, [compareEntity, historyStart, historyEnd]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setShowAllProducts(false);
+    void load();
+  }, [load]);
   useEffect(() => { void loadHistory(); }, [loadHistory]);
 
   const shop = useMemo(() => metrics.find((row) => row.entity_key === "shop") ?? null, [metrics]);
@@ -229,6 +233,12 @@ export default function ShopeeAdsPage() {
     () => metrics.filter((row) => row.entity_type === "item").sort((a, b) => d(b.expense).comparedTo(d(a.expense))),
     [metrics],
   );
+
+  const visibleProductRows = useMemo(
+    () => showAllProducts ? productRows : productRows.slice(0, 3),
+    [productRows, showAllProducts],
+  );
+  const hiddenProductCount = Math.max(0, productRows.length - 3);
 
   const topExpense = productRows[0] ?? null;
   const bestRoas = useMemo(
@@ -433,7 +443,15 @@ export default function ShopeeAdsPage() {
         </CardContent>
       </Card>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <Card>
+        <CardHeader>
+          <CardTitle>Geral da loja</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Performance consolidada da loja no período selecionado, vinda do endpoint geral de Shopee Ads.
+          </p>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="Investimento Ads" value={loading ? "Carregando..." : formatBRL(String(shop?.expense ?? 0))} />
         <MetricCard label="GMV amplo atribuído" value={loading ? "Carregando..." : formatBRL(String(shop?.broad_gmv ?? 0))} />
         <MetricCard label="ROAS amplo" value={loading ? "..." : roas(shop?.broad_roas ?? 0)} />
@@ -442,7 +460,9 @@ export default function ShopeeAdsPage() {
         <MetricCard label="ROAS direto" value={loading ? "..." : roas(shop?.direct_roas ?? 0)} />
         <MetricCard label="Cliques" value={loading ? "..." : numberBr(shop?.clicks ?? 0)} />
         <MetricCard label="Conversões amplas" value={loading ? "..." : numberBr(shop?.broad_order ?? 0)} />
-      </div>
+          </div>
+        </CardContent>
+      </Card>
 
       {!loading && !shop ? (
         <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
@@ -498,7 +518,7 @@ export default function ShopeeAdsPage() {
                 <tr><td className="p-3" colSpan={9}>Carregando...</td></tr>
               ) : productRows.length === 0 ? (
                 <tr><td className="p-3 text-muted-foreground" colSpan={9}>Nenhum produto com performance atribuída neste período.</td></tr>
-              ) : productRows.map((row) => (
+              ) : visibleProductRows.map((row) => (
                 <tr key={row.entity_key} className="border-b">
                   <td className="p-3">
                     <div className="font-medium">{row.item_name || `Item ${row.shopee_item_id}`}</div>
@@ -516,6 +536,21 @@ export default function ShopeeAdsPage() {
               ))}
             </tbody>
           </table>
+
+          {!loading && productRows.length > 3 ? (
+            <div className="border-t p-3">
+              <Button
+                type="button"
+                variant="ghost"
+                className="w-full"
+                onClick={() => setShowAllProducts((current) => !current)}
+              >
+                {showAllProducts
+                  ? "Mostrar somente os 3 principais"
+                  : `Ver outros ${hiddenProductCount} produto${hiddenProductCount === 1 ? "" : "s"}`}
+              </Button>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
