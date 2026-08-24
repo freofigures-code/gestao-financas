@@ -105,8 +105,11 @@ function decimal(value: string | number | null | undefined) {
 }
 
 function isCreditCharge(row: PluggyTransaction) {
-  // Em cartão, DEBIT identifica compra/gasto. Não filtramos pelo sinal do amount.
-  return row.account_type === "CREDIT" && row.transaction_type === "DEBIT";
+  // DEBIT é a semântica correta; signed_amount > 0 mantém compatibilidade
+  // com linhas sincronizadas antes da correção do backend.
+  return row.account_type === "CREDIT" && (
+    row.transaction_type === "DEBIT" || decimal(row.signed_amount).greaterThan(0)
+  );
 }
 
 function isBankOutflow(row: PluggyTransaction) {
@@ -398,12 +401,37 @@ export default function Compras() {
     setPluggySyncing(true);
     try {
       const response = await fetch("/api/integrations/pluggy/pull", { method: "POST" });
-      const body = await response.json().catch(() => ({})) as { error?: unknown; sync?: { transactions?: unknown; creditAccounts?: unknown } };
+      const body = await response.json().catch(() => ({})) as {
+        error?: unknown;
+        sync?: {
+          transactions?: unknown;
+          creditAccounts?: unknown;
+          creditCardTransactions?: unknown;
+          creditCardPurchases?: unknown;
+          creditCardWarningCodes?: unknown;
+        };
+      };
       if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
       const count = typeof body.sync?.transactions === "number" ? body.sync.transactions : 0;
       const cards = typeof body.sync?.creditAccounts === "number" ? body.sync.creditAccounts : 0;
-      toast.success(`Pluggy atualizada: ${count} transação(ões), ${cards} cartão(ões).`);
+      const cardTransactions = typeof body.sync?.creditCardTransactions === "number" ? body.sync.creditCardTransactions : 0;
+      const cardPurchases = typeof body.sync?.creditCardPurchases === "number" ? body.sync.creditCardPurchases : 0;
+      const warningCodes = Array.isArray(body.sync?.creditCardWarningCodes)
+        ? body.sync!.creditCardWarningCodes!.filter((code): code is string => typeof code === "string")
+        : [];
+
       setRefreshKey((value) => value + 1);
+
+      if (cards > 0 && cardTransactions === 0) {
+        const missingPermission = warningCodes.includes("CC_006");
+        toast.warning(
+          missingPermission
+            ? "Cartão encontrado, mas a Pluggy informou CC_006: falta permissão CREDIT_CARDS_TRANSACTIONS. Reautorize o Nubank PJ no MeuPluggy."
+            : "Cartão encontrado, mas a Pluggy retornou 0 transações do cartão. Reautorize/atualize a conexão Nubank PJ no MeuPluggy e sincronize novamente.",
+        );
+      } else {
+        toast.success(`Pluggy atualizada: ${count} transação(ões), ${cards} cartão(ões), ${cardPurchases} compra(s) de cartão.`);
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Falha ao atualizar dados da Pluggy.");
     } finally {
@@ -578,7 +606,7 @@ export default function Compras() {
             <Card>
               <CardHeader>
                 <CardTitle>Cartão(ões) Nubank PJ</CardTitle>
-                <p className="text-sm text-muted-foreground">Os valores abaixo são os campos devolvidos pela Pluggy para cada conta CREDIT; quando algum campo não vier do banco, o painel mostra “—” em vez de estimar.</p>
+                <p className="text-sm text-muted-foreground">Este bloco é apenas o resumo do cartão/fatura. As compras individuais aparecem em “Recebedores e estabelecimentos” e “Movimentações importadas do Nubank” quando a Pluggy entrega as transações da conta CREDIT.</p>
               </CardHeader>
               <CardContent className="overflow-x-auto p-0">
                 <Table>
