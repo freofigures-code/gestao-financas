@@ -20,6 +20,7 @@ type PluggySettingsRow = {
 
 type JsonRecord = Record<string, unknown>;
 type SpendClassification = "business" | "personal" | "transfer" | "card_payment" | "credit" | "ignore" | "review";
+type BillSettlementStatus = "future" | "paid" | "partial" | "unpaid" | "awaiting_confirmation";
 
 type ExistingManual = {
   classification: SpendClassification;
@@ -169,7 +170,7 @@ export async function validatePluggyCredentials(clientId: string, clientSecret: 
 }
 
 function arrayFromList(body: JsonRecord): JsonRecord[] {
-  const candidates = body.results ?? body.data ?? body.connectors ?? body.accounts;
+  const candidates = body.results ?? body.data ?? body.connectors ?? body.accounts ?? body.bills;
   if (Array.isArray(candidates)) return candidates.filter((item): item is JsonRecord => Boolean(object(item)));
   return [];
 }
@@ -450,6 +451,193 @@ async function listAllTransactions(apiKey: string, accountId: string): Promise<J
   throw new Error(`A paginação da Pluggy ultrapassou ${MAX_TRANSACTION_PAGES} páginas; sincronização interrompida para evitar loop.`);
 }
 
+async function listCreditCardBills(apiKey: string, accountId: string): Promise<JsonRecord[]> {
+  const query = new URLSearchParams({ accountId });
+  const body = await pluggyRequest(apiKey, `/bills?${query.toString()}`);
+  return arrayFromList(body);
+}
+
+function records(value: unknown): JsonRecord[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is JsonRecord => Boolean(object(item)))
+    : [];
+}
+
+function cents(value: unknown): number {
+  return Math.round(Math.abs(numberOrNull(value) ?? 0) * 100);
+}
+
+function moneyFromCents(value: number): number {
+  return Math.round(value) / 100;
+}
+
+function sumRecordAmounts(rows: JsonRecord[]): number {
+  return rows.reduce((total, row) => total + cents(row.amount), 0);
+}
+
+function latestPaymentDate(rows: JsonRecord[]): string | null {
+  const values = rows
+    .map((row) => string(row.paymentDate))
+    .filter(Boolean)
+    .sort();
+  return values.length ? values[values.length - 1] : null;
+}
+
+function todaySaoPaulo(): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
+type SyncedBill = {
+  pluggyBillId: string;
+  dueDate: string;
+  totalAmount: number;
+  settlementStatus: BillSettlementStatus;
+  settledAt: string | null;
+};
+
+function deriveCreditCardBills(
+  rawBills: JsonRecord[],
+  userId: string,
+  itemId: string,
+  accountId: string,
+  syncAt: string,
+): { rows: Record<string, unknown>[]; mapped: SyncedBill[] } {
+  const today = todaySaoPaulo();
+
+  const base = rawBills
+    .map((bill) => {
+      const pluggyBillId = string(bill.id);
+      const dueDate = dateOrNull(bill.dueDate);
+      if (!pluggyBillId || !dueDate) return null;
+
+      const payments = records(bill.payments);
+      const financeCharges = records(bill.financeCharges);
+      return {
+        pluggyBillId,
+        dueDate,
+        billClosingDate: dateOrNull(bill.billClosingDate),
+        totalAmountCents: cents(bill.totalAmount),
+        currencyCode: string(bill.totalAmountCurrencyCode) || string(bill.currencyCode) || "BRL",
+        minimumPaymentAmount: numberOrNull(bill.minimumPaymentAmount),
+        allowsInstallments: typeof bill.allowsInstallments === "boolean" ? bill.allowsInstallments : null,
+        payments,
+        financeCharges,
+        paymentsTotalCents: sumRecordAmounts(payments),
+        financeChargesTotalCents: sumRecordAmounts(financeCharges),
+      };
+    })
+    .filter((bill): bill is NonNullable<typeof bill> => Boolean(bill))
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+
+  const mapped: SyncedBill[] = [];
+  const rows: Record<string, unknown>[] = [];
+
+  for (let index = 0; index < base.length; index += 1) {
+    const bill = base[index];
+    const nextBill = base[index + 1] ?? null;
+
+    let settlementStatus: BillSettlementStatus;
+    let expectedSettlementCents: number | null = null;
+    let settledAt: string | null = null;
+
+    if (nextBill) {
+      // Regra oficial documentada pela Pluggy para verificar a quitação da fatura N:
+      // totalAmount(N) + financeCharges(N+1) deve ser coberto por payments(N+1).
+      expectedSettlementCents = bill.totalAmountCents + nextBill.financeChargesTotalCents;
+      const paidCents = nextBill.paymentsTotalCents;
+
+      if (expectedSettlementCents === 0 || paidCents >= expectedSettlementCents) {
+        settlementStatus = "paid";
+        settledAt = latestPaymentDate(nextBill.payments);
+      } else if (paidCents > 0) {
+        settlementStatus = "partial";
+        settledAt = latestPaymentDate(nextBill.payments);
+      } else {
+        settlementStatus = "unpaid";
+      }
+    } else if (bill.dueDate > today) {
+      settlementStatus = "future";
+    } else {
+      // Não existe ciclo seguinte suficiente para aplicar a fórmula oficial.
+      // Não inferimos "pago" por descrição, valor ou data da conta BANK.
+      settlementStatus = "awaiting_confirmation";
+    }
+
+    rows.push({
+      user_id: userId,
+      pluggy_bill_id: bill.pluggyBillId,
+      pluggy_account_id: accountId,
+      pluggy_item_id: itemId,
+      due_date: bill.dueDate,
+      bill_closing_date: bill.billClosingDate,
+      total_amount: moneyFromCents(bill.totalAmountCents),
+      currency_code: bill.currencyCode,
+      minimum_payment_amount: bill.minimumPaymentAmount,
+      allows_installments: bill.allowsInstallments,
+      payments: bill.payments,
+      finance_charges: bill.financeCharges,
+      payments_total: moneyFromCents(bill.paymentsTotalCents),
+      finance_charges_total: moneyFromCents(bill.financeChargesTotalCents),
+      expected_settlement_amount: expectedSettlementCents === null ? null : moneyFromCents(expectedSettlementCents),
+      next_bill_id: nextBill?.pluggyBillId ?? null,
+      settlement_status: settlementStatus,
+      settlement_source: nextBill ? "pluggy_next_bill_formula" : "awaiting_next_bill_cycle",
+      settled_at: settledAt,
+      synced_at: syncAt,
+      updated_at: syncAt,
+    });
+
+    mapped.push({
+      pluggyBillId: bill.pluggyBillId,
+      dueDate: bill.dueDate,
+      totalAmount: moneyFromCents(bill.totalAmountCents),
+      settlementStatus,
+      settledAt,
+    });
+  }
+
+  return { rows, mapped };
+}
+
+function cardItemPaymentStatus(
+  accountType: "BANK" | "CREDIT",
+  transactionType: "DEBIT" | "CREDIT",
+  status: string,
+  billId: string | null,
+  billForecastDate: string | null,
+  billMap: Map<string, SyncedBill>,
+): { status: BillSettlementStatus | "not_applicable"; dueDate: string | null; billTotalAmount: number | null } {
+  if (accountType !== "CREDIT" || transactionType !== "DEBIT") {
+    return { status: "not_applicable", dueDate: null, billTotalAmount: null };
+  }
+
+  if (billId) {
+    const bill = billMap.get(billId);
+    if (bill) {
+      return {
+        status: bill.settlementStatus,
+        dueDate: bill.dueDate,
+        billTotalAmount: bill.totalAmount,
+      };
+    }
+    return { status: "awaiting_confirmation", dueDate: null, billTotalAmount: null };
+  }
+
+  // A Pluggy documenta PENDING sem billId para fatura aberta/futura.
+  if (status === "PENDING" || billForecastDate) {
+    return { status: "future", dueDate: null, billTotalAmount: null };
+  }
+
+  return { status: "awaiting_confirmation", dueDate: null, billTotalAmount: null };
+}
+
 function dateOrNull(value: unknown): string | null {
   const raw = string(value);
   return /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : null;
@@ -462,6 +650,10 @@ export type PluggyPullResult = {
   transactions: number;
   creditCardTransactions: number;
   creditCardPurchases: number;
+  creditCardBills: number;
+  paidBills: number;
+  unsettledBills: number;
+  billSyncErrors: string[];
   creditCardWarningCodes: string[];
   selectedAccountId: string | null;
   selectedAccountName: string | null;
@@ -570,6 +762,73 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     if (key) rules.set(key, { classification, categoryId: row.category_id ? String(row.category_id) : null });
   }
 
+const billMap = new Map<string, SyncedBill>();
+  const billSyncErrors: string[] = [];
+  let creditCardBills = 0;
+  let paidBills = 0;
+  let unsettledBills = 0;
+
+  for (const creditAccount of creditAccounts) {
+    const creditAccountId = string(creditAccount.id);
+    if (!creditAccountId) continue;
+
+    try {
+      const rawBills = await listCreditCardBills(apiKey, creditAccountId);
+      const derived = deriveCreditCardBills(rawBills, userId, itemId, creditAccountId, syncAt);
+
+      if (derived.rows.length) {
+        const { error: billUpsertError } = await admin
+          .from("pluggy_credit_card_bills")
+          .upsert(derived.rows, { onConflict: "user_id,pluggy_bill_id" });
+        if (billUpsertError) throw new Error(`[Pluggy/faturas] ${billUpsertError.message}`);
+      }
+
+      const { error: pruneBillsError } = await admin
+        .from("pluggy_credit_card_bills")
+        .delete()
+        .eq("user_id", userId)
+        .eq("pluggy_account_id", creditAccountId)
+        .lt("synced_at", syncAt);
+      if (pruneBillsError) throw new Error(`[Pluggy/faturas antigas] ${pruneBillsError.message}`);
+
+      for (const bill of derived.mapped) billMap.set(bill.pluggyBillId, bill);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      billSyncErrors.push(`${creditAccountId}: ${message}`);
+
+      // Se a consulta de Bills falhar, preservamos o último espelho conhecido.
+      // O sistema não marca nada como pago com base em valor/data da conta BANK.
+      const { data: existingBills, error: existingBillsError } = await admin
+        .from("pluggy_credit_card_bills")
+        .select("pluggy_bill_id,due_date,total_amount,settlement_status,settled_at")
+        .eq("user_id", userId)
+        .eq("pluggy_account_id", creditAccountId);
+      if (existingBillsError) throw new Error(`[Pluggy/faturas existentes] ${existingBillsError.message}`);
+
+      for (const row of existingBills ?? []) {
+        const pluggyBillId = String(row.pluggy_bill_id ?? "");
+        if (!pluggyBillId) continue;
+        billMap.set(pluggyBillId, {
+          pluggyBillId,
+          dueDate: String(row.due_date ?? ""),
+          totalAmount: Number(row.total_amount ?? 0),
+          settlementStatus: String(row.settlement_status ?? "awaiting_confirmation") as BillSettlementStatus,
+          settledAt: row.settled_at ? String(row.settled_at) : null,
+        });
+      }
+    }
+  }
+
+  const { data: allBillsForStats, error: billStatsError } = await admin
+    .from("pluggy_credit_card_bills")
+    .select("pluggy_bill_id,settlement_status")
+    .eq("user_id", userId)
+    .eq("pluggy_item_id", itemId);
+  if (billStatsError) throw new Error(`[Pluggy/faturas/resumo] ${billStatsError.message}`);
+  creditCardBills = (allBillsForStats ?? []).length;
+  paidBills = (allBillsForStats ?? []).filter((row: any) => row.settlement_status === "paid").length;
+  unsettledBills = creditCardBills - paidBills;
+
   const personalReceiverName = string(settings.pluggy_personal_receiver_name) || "KEVYN APARECIDO FREO";
   let transactionCount = 0;
   let creditCardTransactions = 0;
@@ -636,6 +895,18 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
       const paymentData = object(transaction.paymentData);
       const creditCardMetadata = object(transaction.creditCardMetadata);
       const originalAmount = roundMoney(transaction.amount);
+      const txType = transactionTypeOf(transaction, accountType);
+      const txStatus = string(transaction.status).toUpperCase() || "POSTED";
+      const billId = string(creditCardMetadata?.billId) || null;
+      const billForecastDate = string(creditCardMetadata?.billForecastDate) || null;
+      const paymentState = cardItemPaymentStatus(
+        accountType,
+        txType,
+        txStatus,
+        billId,
+        billForecastDate,
+        billMap,
+      );
       return {
         user_id: userId,
         pluggy_transaction_id: transactionId,
@@ -648,8 +919,8 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
         description_raw: string(transaction.descriptionRaw) || null,
         amount: absMoney(originalAmount),
         signed_amount: originalAmount,
-        transaction_type: transactionTypeOf(transaction, accountType),
-        status: string(transaction.status).toUpperCase() || "POSTED",
+        transaction_type: txType,
+        status: txStatus,
         operation_type: string(transaction.operationType).toUpperCase() || null,
         payment_method: string(paymentData?.paymentMethod).toUpperCase() || null,
         payer_name: identity.payerName,
@@ -669,8 +940,11 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
         installment_number: integerOrNull(creditCardMetadata?.installmentNumber),
         total_installments: integerOrNull(creditCardMetadata?.totalInstallments),
         total_amount: numberOrNull(creditCardMetadata?.totalAmount) !== null ? absMoney(creditCardMetadata?.totalAmount) : null,
-        bill_id: string(creditCardMetadata?.billId) || null,
-        bill_forecast_date: string(creditCardMetadata?.billForecastDate) || null,
+        bill_id: billId,
+        bill_forecast_date: billForecastDate,
+        card_payment_status: paymentState.status,
+        bill_due_date: paymentState.dueDate,
+        bill_total_amount: paymentState.billTotalAmount,
         synced_at: syncAt,
       };
     }).filter((row): row is NonNullable<typeof row> => Boolean(row));
@@ -709,6 +983,10 @@ export async function pullPluggyData(userId: string): Promise<PluggyPullResult> 
     transactions: transactionCount,
     creditCardTransactions,
     creditCardPurchases,
+    creditCardBills,
+    paidBills,
+    unsettledBills,
+    billSyncErrors,
     creditCardWarningCodes,
     selectedAccountId: selectedAccountId || null,
     selectedAccountName: selectedAccount ? (string(selectedAccount.marketingName) || string(selectedAccount.name) || "Conta bancária") : null,
@@ -750,6 +1028,8 @@ export async function revokePluggyItemAndClear(userId: string): Promise<void> {
   const admin = createAdminClient();
   const { error: txError } = await admin.from("pluggy_bank_transactions").delete().eq("user_id", userId);
   if (txError) throw new Error(`[Pluggy/remover transações] ${txError.message}`);
+  const { error: billsError } = await admin.from("pluggy_credit_card_bills").delete().eq("user_id", userId);
+  if (billsError && !/does not exist|schema cache/i.test(billsError.message)) throw new Error(`[Pluggy/remover faturas] ${billsError.message}`);
   const { error: accountError } = await admin.from("pluggy_bank_accounts").delete().eq("user_id", userId);
   if (accountError) throw new Error(`[Pluggy/remover contas] ${accountError.message}`);
   const { error: rulesError } = await admin.from("pluggy_spend_rules").delete().eq("user_id", userId);
