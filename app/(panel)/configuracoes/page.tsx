@@ -1322,10 +1322,13 @@ export default async function ConfiguracoesPage({ searchParams }: PageProps) {
       </Card>
 
       <Card>
-        <CardHeader><CardTitle>IA e n8n</CardTitle></CardHeader>
+        <CardHeader>
+          <CardTitle>IA Gestão Financeira e n8n</CardTitle>
+          <p className="text-sm text-muted-foreground">O webhook alimenta a memória financeira e recebe as mensagens do chat. Depois de salvar, faça a primeira sincronização no painel de Assistentes de IA.</p>
+        </CardHeader>
         <CardContent className="space-y-4">
           <form action={saveAiIntegration} className="grid gap-3 md:grid-cols-2">
-            <div><Label htmlFor="ai_webhook_url">Webhook de análise IA</Label><Input id="ai_webhook_url" name="ai_webhook_url" defaultValue={integration.ai_webhook_url ?? ""} /></div>
+            <div><Label htmlFor="ai_webhook_url">Webhook n8n da IA Gestão Financeira</Label><Input id="ai_webhook_url" name="ai_webhook_url" defaultValue={integration.ai_webhook_url ?? ""} placeholder="https://seu-n8n/webhook/FREO_FINANCEIRO_AI" /></div>
             <div>
               <Label htmlFor="ai_enabled">Análise com IA</Label>
               <select id="ai_enabled" name="ai_enabled" className="h-10 w-full rounded-md border bg-background px-3" defaultValue={integration.ai_enabled ? "on" : "off"}>
