@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import Decimal from "decimal.js";
 import {
   Bar,
@@ -159,8 +160,6 @@ export default function ShopeeAdsPage() {
 
   const [aiWebhook, setAiWebhook] = useState("");
   const [savingWebhook, setSavingWebhook] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analysis, setAnalysis] = useState("");
   const [showAllProducts, setShowAllProducts] = useState(false);
 
   const period = useMemo(() => {
@@ -362,33 +361,6 @@ export default function ShopeeAdsPage() {
       toast.error(error instanceof Error ? error.message : "Falha ao salvar webhook.");
     } finally {
       setSavingWebhook(false);
-    }
-  }
-
-  async function analyzeWithAi() {
-    if (analyzing) return;
-    setAnalyzing(true);
-    setAnalysis("");
-    try {
-      const scope = compareEntity === "shop" ? "shop" : "item";
-      const response = await fetch("/api/integrations/shopee-ads/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          from: period.from,
-          to: period.to,
-          scope,
-          itemId: scope === "item" ? compareEntity : null,
-        }),
-      });
-      const body = await response.json().catch(() => ({})) as { error?: unknown; analysis?: unknown };
-      if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
-      if (typeof body.analysis !== "string" || !body.analysis.trim()) throw new Error("A IA respondeu sem análise.");
-      setAnalysis(body.analysis);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Falha na análise com IA.");
-    } finally {
-      setAnalyzing(false);
     }
   }
 
@@ -613,9 +585,9 @@ export default function ShopeeAdsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Análise com IA pelo n8n</CardTitle>
+          <CardTitle>IA Shopee Ads</CardTitle>
           <p className="text-sm text-muted-foreground">
-            O Freo envia ao webhook somente os números sincronizados, histórico mensal e produtos do período.
+            Este webhook alimenta a memória exclusiva da IA Shopee Ads. A conversa fica centralizada no painel de assistentes.
           </p>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -625,24 +597,20 @@ export default function ShopeeAdsPage() {
               <Input
                 value={aiWebhook}
                 onChange={(e) => setAiWebhook(e.target.value)}
-                placeholder="https://seu-n8n/webhook/FREO_SHOPEE_ADS_AI_ANALYZE"
+                placeholder="https://seu-n8n/webhook/FREO_SHOPEE_ADS_AI"
               />
             </label>
             <Button type="button" variant="outline" onClick={() => { void saveAiWebhook(); }} disabled={savingWebhook}>
               {savingWebhook ? "Salvando..." : "Salvar webhook"}
             </Button>
-            <Button type="button" onClick={() => { void analyzeWithAi(); }} disabled={analyzing || !shop}>
-              {analyzing ? "Analisando..." : "Analisar período com IA"}
+            <Button asChild type="button">
+              <Link href="/analise-ia#shopee_ads">Abrir conversa com a IA</Link>
             </Button>
           </div>
 
           <div className="text-xs text-muted-foreground">
-            Escopo da análise: {compareEntity === "shop" ? "geral da loja" : items.find((item) => String(item.shopee_item_id) === compareEntity)?.item_name ?? "produto selecionado"}.
+            Depois de salvar, abra a conversa e use “Sincronizar base agora” uma vez. As alterações seguintes serão enviadas automaticamente.
           </div>
-
-          {analysis ? (
-            <div className="whitespace-pre-wrap rounded-lg border bg-muted/30 p-4 text-sm leading-6">{analysis}</div>
-          ) : null}
         </CardContent>
       </Card>
 
